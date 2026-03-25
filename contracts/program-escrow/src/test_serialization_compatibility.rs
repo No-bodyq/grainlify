@@ -225,6 +225,10 @@ fn serialization_compatibility_public_types_and_events() {
                 released: false,
                 released_at: None,
                 released_by: None,
+                approval: PayoutApprovalRecord {
+                    approver: Address::generate(&env),
+                    approved_at: 123,
+                },
             }
             .into_val(&env),
         ),
