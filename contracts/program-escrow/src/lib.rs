@@ -689,8 +689,6 @@ pub struct ProgramAggregateStats {
     pub released_count: u32,
 }
 
-use grainlify_core::errors;
-
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LockItem {

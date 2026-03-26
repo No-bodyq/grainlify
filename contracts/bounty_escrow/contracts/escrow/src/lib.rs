@@ -23,9 +23,9 @@ mod test_frozen_balance;
 mod test_reentrancy_guard;
 
 mod events;
-mod reentrancy_guard;
 mod invariants;
 mod multitoken_invariants;
+mod reentrancy_guard;
 
 use events::{
     emit_batch_funds_locked, emit_batch_funds_released, emit_bounty_initialized,
@@ -2266,7 +2266,11 @@ impl BountyEscrowContract {
         Ok(capability_id.clone())
     }
 
-    pub fn revoke_capability(env: Env, owner: Address, capability_id: BytesN<32>) -> Result<(), Error> {
+    pub fn revoke_capability(
+        env: Env,
+        owner: Address,
+        capability_id: BytesN<32>,
+    ) -> Result<(), Error> {
         let mut capability = Self::load_capability(&env, capability_id.clone())?;
         if capability.owner != owner {
             return Err(Error::Unauthorized);
