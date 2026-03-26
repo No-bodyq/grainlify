@@ -192,7 +192,9 @@ mod monitoring {
     }
 
     fn set_counter(env: &Env, key: &str, value: u64) {
-        env.storage().persistent().set(&Symbol::new(env, key), &value);
+        env.storage()
+            .persistent()
+            .set(&Symbol::new(env, key), &value);
     }
 
     fn get_tracked_users(env: &Env) -> Vec<Address> {

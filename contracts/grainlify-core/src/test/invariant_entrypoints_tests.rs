@@ -1,8 +1,8 @@
 #![cfg(test)]
 
 use crate::{
-    governance, monitoring, DataKey, GovernanceConfig, GrainlifyContract,
-    GrainlifyContractClient, VotingScheme,
+    governance, monitoring, DataKey, GovernanceConfig, GrainlifyContract, GrainlifyContractClient,
+    VotingScheme,
 };
 use soroban_sdk::{
     testutils::{Address as _, Ledger},
@@ -437,10 +437,16 @@ fn test_monitoring_unique_user_count_is_bounded() {
 
     let health = client.health_check();
     assert_eq!(health.last_operation, 99);
-    assert_eq!(health.total_operations, monitoring::MAX_TRACKED_USERS as u64 + 6);
+    assert_eq!(
+        health.total_operations,
+        monitoring::MAX_TRACKED_USERS as u64 + 6
+    );
 
     let analytics = client.get_analytics();
-    assert_eq!(analytics.operation_count, monitoring::MAX_TRACKED_USERS as u64 + 6);
+    assert_eq!(
+        analytics.operation_count,
+        monitoring::MAX_TRACKED_USERS as u64 + 6
+    );
     assert_eq!(analytics.unique_users, monitoring::MAX_TRACKED_USERS as u64);
     assert_eq!(analytics.error_count, 0);
     assert_eq!(analytics.error_rate, 0);
