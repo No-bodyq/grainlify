@@ -451,3 +451,226 @@ fn test_deprecation_status_stable() {
     client.set_deprecated(&true, &None);
     assert!(client.get_deprecation_status().deprecated);
 }
+
+// --- Additional entrypoint coverage ---
+
+/// `batch_lock_funds` locks multiple escrows atomically.
+#[test]
+fn test_batch_lock_funds_stable() {
+    use crate::LockFundsItem;
+    use soroban_sdk::vec;
+
+    let env = Env::default();
+    let (_, depositor, _, client) = setup(&env);
+
+    let items = vec![
+        &env,
+        LockFundsItem { bounty_id: 10, depositor: depositor.clone(), amount: 500, deadline: 9999 },
+        LockFundsItem { bounty_id: 11, depositor: depositor.clone(), amount: 500, deadline: 9999 },
+    ];
+    let count = client.batch_lock_funds(&items);
+    assert_eq!(count, 2);
+    assert_eq!(client.get_escrow_info(&10).status, EscrowStatus::Locked);
+    assert_eq!(client.get_escrow_info(&11).status, EscrowStatus::Locked);
+}
+
+/// `batch_release_funds` releases multiple escrows atomically.
+#[test]
+fn test_batch_release_funds_stable() {
+    use crate::{LockFundsItem, ReleaseFundsItem};
+    use soroban_sdk::vec;
+
+    let env = Env::default();
+    let (_, depositor, _, client) = setup(&env);
+    let contributor = Address::generate(&env);
+
+    let lock_items = vec![
+        &env,
+        LockFundsItem { bounty_id: 20, depositor: depositor.clone(), amount: 500, deadline: 9999 },
+        LockFundsItem { bounty_id: 21, depositor: depositor.clone(), amount: 500, deadline: 9999 },
+    ];
+    client.batch_lock_funds(&lock_items);
+
+    let release_items = vec![
+        &env,
+        ReleaseFundsItem { bounty_id: 20, contributor: contributor.clone() },
+        ReleaseFundsItem { bounty_id: 21, contributor: contributor.clone() },
+    ];
+    let count = client.batch_release_funds(&release_items);
+    assert_eq!(count, 2);
+    assert_eq!(client.get_escrow_info(&20).status, EscrowStatus::Released);
+    assert_eq!(client.get_escrow_info(&21).status, EscrowStatus::Released);
+}
+
+/// `get_aggregate_stats` returns consistent counts after lock/release.
+#[test]
+fn test_get_aggregate_stats_stable() {
+    let env = Env::default();
+    let (_, depositor, _, client) = setup(&env);
+    let contributor = Address::generate(&env);
+
+    client.lock_funds(&depositor, &1, &1000, &9999);
+    client.lock_funds(&depositor, &2, &1000, &9999);
+    client.release_funds(&1, &contributor);
+
+    let stats = client.get_aggregate_stats();
+    assert_eq!(stats.count_locked, 1);
+    assert_eq!(stats.count_released, 1);
+    assert_eq!(stats.total_locked, 1000);
+    assert_eq!(stats.total_released, 1000);
+}
+
+/// `query_escrows_by_depositor` returns only that depositor's escrows.
+#[test]
+fn test_query_escrows_by_depositor_stable() {
+    let env = Env::default();
+    let (_, depositor, _, client) = setup(&env);
+
+    client.lock_funds(&depositor, &1, &500, &9999);
+    client.lock_funds(&depositor, &2, &500, &9999);
+
+    let results = client.query_escrows_by_depositor(&depositor, &0, &10);
+    assert_eq!(results.len(), 2);
+}
+
+/// `get_escrow_ids_by_status` returns IDs matching the given status.
+#[test]
+fn test_get_escrow_ids_by_status_stable() {
+    let env = Env::default();
+    let (_, depositor, _, client) = setup(&env);
+    let contributor = Address::generate(&env);
+
+    client.lock_funds(&depositor, &1, &500, &9999);
+    client.lock_funds(&depositor, &2, &500, &9999);
+    client.release_funds(&1, &contributor);
+
+    let locked_ids = client.get_escrow_ids_by_status(&EscrowStatus::Locked, &0, &10);
+    assert_eq!(locked_ids.len(), 1);
+
+    let released_ids = client.get_escrow_ids_by_status(&EscrowStatus::Released, &0, &10);
+    assert_eq!(released_ids.len(), 1);
+}
+
+/// `set_claim_window` + `authorize_claim` + `claim` happy path is stable.
+#[test]
+fn test_claim_flow_stable() {
+    use crate::DisputeReason;
+
+    let env = Env::default();
+    let (_, depositor, token, client) = setup(&env);
+    let contributor = Address::generate(&env);
+
+    client.set_claim_window(&500);
+    client.lock_funds(&depositor, &1, &1000, &9999);
+    client.authorize_claim(&1, &contributor, &DisputeReason::QualityIssue);
+
+    let claim = client.get_pending_claim(&1);
+    assert_eq!(claim.recipient, contributor);
+    assert!(!claim.claimed);
+
+    env.ledger().set_timestamp(claim.expires_at - 1);
+    client.claim(&1);
+
+    assert_eq!(client.get_escrow_info(&1).status, EscrowStatus::Released);
+    assert_eq!(token.balance(&contributor), 1000);
+}
+
+/// `set_filter_mode` + `set_blocklist_entry` blocks a participant correctly.
+#[test]
+fn test_participant_filter_blocklist_stable() {
+    use crate::ParticipantFilterMode;
+
+    let env = Env::default();
+    let (_, depositor, _, client) = setup(&env);
+
+    client.set_filter_mode(&ParticipantFilterMode::BlocklistOnly);
+    client.set_blocklist_entry(&depositor, &true);
+
+    let res = client.try_lock_funds(&depositor, &1, &500, &9999);
+    assert_eq!(res.unwrap_err().unwrap(), Error::ParticipantBlocked);
+
+    client.set_blocklist_entry(&depositor, &false);
+    client.lock_funds(&depositor, &1, &500, &9999);
+}
+
+/// `set_token_fee_config` / `get_token_fee_config` round-trip is stable.
+#[test]
+fn test_token_fee_config_round_trip_stable() {
+    let env = Env::default();
+    let (admin, _, _, client) = setup(&env);
+    let token_addr = env.register_stellar_asset_contract_v2(admin.clone()).address();
+
+    client.set_token_fee_config(&token_addr, &100, &50, &admin, &true);
+
+    let cfg = client.get_token_fee_config(&token_addr).unwrap();
+    assert_eq!(cfg.lock_fee_rate, 100);
+    assert_eq!(cfg.release_fee_rate, 50);
+    assert!(cfg.fee_enabled);
+}
+
+/// `update_metadata` / `get_metadata` round-trip is stable.
+#[test]
+fn test_metadata_round_trip_stable() {
+    use soroban_sdk::String;
+
+    let env = Env::default();
+    let (admin, depositor, _, client) = setup(&env);
+
+    client.lock_funds(&depositor, &1, &500, &9999);
+    client.update_metadata(&admin, &1, &42, &7, &String::from_str(&env, "bug"), &None);
+
+    let meta = client.get_metadata(&1);
+    assert_eq!(meta.repo_id, 42);
+    assert_eq!(meta.issue_id, 7);
+}
+
+/// `set_anonymous_resolver` + `lock_funds_anonymous` + `refund_resolved` path.
+#[test]
+fn test_anonymous_refund_flow_stable() {
+    use soroban_sdk::BytesN;
+
+    let env = Env::default();
+    let (_, depositor, token, client) = setup(&env);
+    let resolver = Address::generate(&env);
+    let recipient = Address::generate(&env);
+
+    client.set_anonymous_resolver(&Some(resolver.clone()));
+
+    let commitment: BytesN<32> = BytesN::from_array(&env, &[1u8; 32]);
+    let deadline = env.ledger().timestamp() + 100;
+    client.lock_funds_anonymous(&depositor, &commitment, &1, &1000, &deadline);
+
+    env.ledger().set_timestamp(deadline + 1);
+    client.refund_resolved(&1, &recipient);
+
+    assert_eq!(token.balance(&recipient), 1000);
+}
+
+/// `refund_with_capability` delegates a bounded refund without admin rights.
+#[test]
+fn test_refund_with_capability_stable() {
+    let env = Env::default();
+    let (admin, depositor, token, client) = setup(&env);
+    let holder = Address::generate(&env);
+
+    let deadline = env.ledger().timestamp() + 9999;
+    client.lock_funds(&depositor, &1, &1000, &deadline);
+
+    let cap_expiry = env.ledger().timestamp() + 500;
+    let cap_id = client.issue_capability(
+        &admin,
+        &holder,
+        &crate::CapabilityAction::Refund,
+        &1,
+        &500,
+        &cap_expiry,
+        &1,
+    );
+
+    client.refund_with_capability(&1, &500, &holder, &cap_id);
+
+    let e = client.get_escrow_info(&1);
+    assert_eq!(e.remaining_amount, 500);
+    assert_eq!(e.status, EscrowStatus::PartiallyRefunded);
+    assert_eq!(token.balance(&depositor), 100_000 - 500);
+}
