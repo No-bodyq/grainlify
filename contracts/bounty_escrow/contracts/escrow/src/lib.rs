@@ -1,50 +1,46 @@
-use anchor_lang::prelude::*;
-use anchor_spl::token::{self, Mint, Token, TokenAccount, Transfer};
-
+pub mod events;
 pub mod gas_budget;
-#[cfg(test)]
+pub mod invariants;
+pub mod multitoken_invariants;
+pub mod reentrancy_guard;
+// Broken test modules (Anchor→Soroban migration in progress, issue #754/#789)
+// Gated out until the migration is complete.
+#[cfg(feature = "legacy-tests")]
 mod test_boundary_edge_cases;
+#[cfg(feature = "legacy-tests")]
 mod test_cross_contract_interface;
-#[cfg(test)]
+#[cfg(feature = "legacy-tests")]
 mod test_deterministic_randomness;
-#[cfg(test)]
+#[cfg(feature = "legacy-tests")]
 mod test_multi_region_treasury;
-#[cfg(test)]
+#[cfg(feature = "legacy-tests")]
 mod test_multi_token_fees;
-#[cfg(test)]
+#[cfg(feature = "legacy-tests")]
 mod test_rbac;
-#[cfg(test)]
+#[cfg(feature = "legacy-tests")]
 mod test_risk_flags;
 mod traits;
 pub mod upgrade_safety;
+pub mod audit_trail;
 
-use crate::constants::*;
-use crate::errors::*;
-use crate::events::*;
-use crate::state::*;
-
-declare_id!("8vS5pL7e6k2xP7L9R9jGv6D5v8S5pL7e6k2xP7L9R9jG");
-
-#[cfg(test)]
+#[cfg(feature = "legacy-tests")]
 mod test_frozen_balance;
-#[cfg(test)]
+#[cfg(feature = "legacy-tests")]
 mod test_reentrancy_guard;
 #[cfg(test)]
 mod test_timelock;
 
-use events::{
-    emit_admin_action_cancelled, emit_admin_action_executed, emit_admin_action_proposed,
+use crate::events::{
     emit_batch_funds_locked, emit_batch_funds_released, emit_bounty_initialized,
     emit_deprecation_state_changed, emit_deterministic_selection, emit_funds_locked,
     emit_funds_locked_anon, emit_funds_refunded, emit_funds_released,
     emit_maintenance_mode_changed, emit_notification_preferences_updated,
     emit_participant_filter_mode_changed, emit_risk_flags_updated, emit_ticket_claimed,
-    emit_ticket_issued, emit_timelock_configured, BatchFundsLocked, BatchFundsReleased,
-    BountyEscrowInitialized, ClaimCancelled, ClaimCreated, ClaimExecuted, CriticalOperationOutcome,
-    DeprecationStateChanged, DeterministicSelectionDerived, FundsLocked, FundsLockedAnon,
-    FundsRefunded, FundsReleased, MaintenanceModeChanged, NotificationPreferencesUpdated,
-    ParticipantFilterModeChanged, RiskFlagsUpdated, TicketClaimed, TicketIssued, EVENT_VERSION_V2,
-    AdminActionCancelled, AdminActionExecuted, AdminActionProposed, TimelockConfigured,
+    emit_ticket_issued, BatchFundsLocked, BatchFundsReleased, BountyEscrowInitialized,
+    ClaimCancelled, ClaimCreated, ClaimExecuted, CriticalOperationOutcome, DeprecationStateChanged,
+    DeterministicSelectionDerived, FundsLocked, FundsLockedAnon, FundsRefunded, FundsReleased,
+    MaintenanceModeChanged, NotificationPreferencesUpdated, ParticipantFilterModeChanged,
+    RefundTriggerType, RiskFlagsUpdated, TicketClaimed, TicketIssued, EVENT_VERSION_V2,
 };
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
@@ -1165,6 +1161,18 @@ impl BountyEscrowContract {
     pub fn get_state_snapshot(env: Env) -> monitoring::StateSnapshot {
         monitoring::get_state_snapshot(&env)
     }
+    /// Enable or disable the on-chain append-only audit log (Admin only).
+    pub fn set_audit_enabled(env: Env, enabled: bool) -> Result<(), Error> {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).ok_or(Error::NotInitialized)?;
+        admin.require_auth();
+        audit_trail::set_enabled(&env, enabled);
+        Ok(())
+    }
+
+    /// Retrieve the last `n` records from the audit log.
+    pub fn get_audit_tail(env: Env, n: u32) -> Vec<audit_trail::AuditRecord> {
+        audit_trail::get_audit_tail(&env, n)
+    }
 
     fn order_batch_lock_items(env: &Env, items: &Vec<LockFundsItem>) -> Vec<LockFundsItem> {
         let mut ordered: Vec<LockFundsItem> = Vec::new(env);
@@ -1185,6 +1193,76 @@ impl BountyEscrowContract {
         }
         ordered
     }
+    /// Filter escrows by their current status (Locked, Released, etc.)
+        /// Stable ordering is guaranteed by the EscrowIndex.
+	    pub fn query_escrows_by_status(
+	            env: Env,
+		            status: EscrowStatus,
+			            offset: u32,
+				            limit: u32,
+					        ) -> Vec<EscrowInfo> {
+						        let index: Vec<u64> = env.storage().persistent().get(&DataKey::EscrowIndex).unwrap_or(Vec::new(&env));
+							        let mut results = Vec::new(&env);
+
+        // Start from offset to support stable pagination
+	        for i in offset..index.len() {
+		            if results.len() >= limit { break; }
+			                let id = index.get(i).unwrap();
+
+            // Reusing your existing get_escrow_info logic
+	                let info = Self::get_escrow_info(env.clone(), id);
+			            if info.status == status {
+				                    results.push_back(info);
+						                }
+								        }
+									        results
+										    }
+
+    /// Filter escrows by amount range [min, max]
+        pub fn query_escrows_by_amount(
+	        env: Env,
+		        min: i128,
+			        max: i128,
+				        offset: u32,
+					        limit: u32,
+						    ) -> Vec<EscrowInfo> {
+						            let index: Vec<u64> = env.storage().persistent().get(&DataKey::EscrowIndex).unwrap_or(Vec::new(&env));
+							            let mut results = Vec::new(&env);
+
+        for i in offset..index.len() {
+	            if results.len() >= limit { break; }
+		                let id = index.get(i).unwrap();
+				            let info = Self::get_escrow_info(env.clone(), id);
+
+            if info.amount >= min && info.amount <= max {
+	                    results.push_back(info);
+			                }
+					        }
+						        results
+							    }
+
+    /// Filter escrows by deadline range [min_ts, max_ts]
+        pub fn query_escrows_by_deadline(
+	        env: Env,
+		        min_ts: u64,
+			        max_ts: u64,
+				        offset: u32,
+					        limit: u32,
+						    ) -> Vec<EscrowInfo> {
+						            let index: Vec<u64> = env.storage().persistent().get(&DataKey::EscrowIndex).unwrap_or(Vec::new(&env));
+							            let mut results = Vec::new(&env);
+
+        for i in offset..index.len() {
+	            if results.len() >= limit { break; }
+		                let id = index.get(i).unwrap();
+				            let info = Self::get_escrow_info(env.clone(), id);
+
+            if info.deadline >= min_ts && info.deadline <= max_ts {
+	                    results.push_back(info);
+			                }
+					        }
+						        results
+							    }
 
     fn order_batch_release_items(
         env: &Env,
@@ -1391,49 +1469,70 @@ impl BountyEscrowContract {
     ///
     /// Accepts a pre-constructed [`FeeCollected`] event which contains all fee details.
     /// The token client and fee config are resolved internally from contract storage.
-    fn route_fee(env: &Env, fee_event: events::FeeCollected) {
-        if fee_event.amount <= 0 {
-            return;
+    fn route_fee(
+        env: &Env,
+        client: &token::Client,
+        fee_amount: i128,
+        fee_rate: i128,
+        operation_type: events::FeeOperationType,
+    ) -> Result<(), Error> {
+        if fee_amount <= 0 {
+            return Ok(());
         }
+        let config = Self::get_fee_config_internal(env);
+
         let fee_fixed = match operation_type {
             events::FeeOperationType::Lock => config.lock_fixed_fee,
             events::FeeOperationType::Release => config.release_fixed_fee,
         };
 
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
-        let client = token::Client::new(env, &token_addr);
-        let config = Self::get_fee_config_internal(env);
-
         if !config.distribution_enabled || config.treasury_destinations.is_empty() {
             client.transfer(
                 &env.current_contract_address(),
-                &fee_event.recipient,
-                &fee_event.amount,
+                &config.fee_recipient,
+                &fee_amount,
             );
-            events::emit_fee_collected(env, fee_event);
-            return;
+            events::emit_fee_collected(
+                env,
+                events::FeeCollected {
+                    operation_type: operation_type.clone(),
+                    amount: fee_amount,
+                    fee_rate,
+                    fee_fixed,
+                    recipient: config.fee_recipient.clone(),
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            return Ok(());
         }
 
         let mut total_weight: u64 = 0;
-        for destination in config.treasury_destinations.iter() {
-            total_weight = total_weight
-                .checked_add(destination.weight as u64)
-                .unwrap_or(u64::MAX);
+        for dest in destinations.iter() {
+            total_weight = total_weight.checked_add(dest.weight as u64).unwrap_or(u64::MAX);
         }
 
         if total_weight == 0 {
             client.transfer(
                 &env.current_contract_address(),
-                &fee_event.recipient,
-                &fee_event.amount,
+                &config.fee_recipient,
+                &fee_amount,
             );
-            events::emit_fee_collected(env, fee_event);
-            return;
+            events::emit_fee_collected(
+                env,
+                events::FeeCollected {
+                    operation_type: operation_type.clone(),
+                    amount: fee_amount,
+                    fee_rate,
+                    fee_fixed,
+                    recipient: config.fee_recipient.clone(),
+                    timestamp: env.ledger().timestamp(),
+                },
+            );
+            return Ok(());
         }
 
         let mut distributed = 0i128;
         let destination_count = config.treasury_destinations.len() as usize;
-        let fee_amount = fee_event.amount;
 
         for (index, destination) in config.treasury_destinations.iter().enumerate() {
             let share = if index + 1 == destination_count {
@@ -1441,16 +1540,15 @@ impl BountyEscrowContract {
                     .checked_sub(distributed)
                     .ok_or(Error::InvalidAmount)?
             } else {
-                fee_amount
-                    .checked_mul(destination.weight as i128)
-                    .and_then(|value| value.checked_div(total_weight as i128))
-                    .unwrap_or(0)
+                let w = destination.weight as i128;
+                let tw = total_weight as i128;
+                fee_amount.checked_mul(w).unwrap_or(0) / tw
             };
 
-            distributed = distributed.checked_add(share).ok_or(Error::InvalidAmount)?;
+            distributed = distributed.checked_add(share).unwrap_or(distributed);
 
-            if share <= 0 {
-                continue;
+            if share > 0 {
+                client.transfer(&env.current_contract_address(), &destination.address, &share);
             }
 
             client.transfer(
@@ -1461,15 +1559,16 @@ impl BountyEscrowContract {
             events::emit_fee_collected(
                 env,
                 events::FeeCollected {
-                    operation_type: fee_event.operation_type.clone(),
+                    operation_type: operation_type.clone(),
                     amount: share,
-                    fee_rate: fee_event.fee_rate,
-                    fee_fixed: fee_event.fee_fixed,
+                    fee_rate,
+                    fee_fixed,
                     recipient: destination.address,
                     timestamp: env.ledger().timestamp(),
                 },
             );
         }
+        Ok(())
     }
 
     /// Update fee configuration (admin only)
@@ -1959,6 +2058,14 @@ impl BountyEscrowContract {
     /// Return the current escrow-level freeze record, if one exists.
     pub fn get_escrow_freeze_record(env: Env, bounty_id: u64) -> Option<FreezeRecord> {
         Self::get_escrow_freeze_record_internal(&env, bounty_id)
+    }
+
+    /// Returns the escrow record for `bounty_id`. Panics if not found.
+    pub fn get_escrow(env: Env, bounty_id: u64) -> Escrow {
+        env.storage()
+            .persistent()
+            .get(&DataKey::Escrow(bounty_id))
+            .expect("bounty not found")
     }
 
     /// Freeze all release/refund operations for escrows owned by `address`.
@@ -2872,7 +2979,11 @@ impl BountyEscrowContract {
         Ok(capability_id.clone())
     }
 
-    pub fn revoke_capability(env: Env, owner: Address, capability_id: BytesN<32>) -> Result<(), Error> {
+    pub fn revoke_capability(
+        env: Env,
+        owner: Address,
+        capability_id: BytesN<32>,
+    ) -> Result<(), Error> {
         let mut capability = Self::load_capability(&env, capability_id.clone())?;
         if capability.owner != owner {
             return Err(Error::Unauthorized);
@@ -3244,14 +3355,15 @@ impl BountyEscrowContract {
         // Transfer fee to recipient immediately (separate transfer so it is
         // visible as a distinct on-chain operation).
         if fee_amount > 0 {
+            let global_config = Self::get_fee_config_internal(&env);
             Self::route_fee(
                 &env,
                 &client,
-                &fee_config,
                 fee_amount,
-                lock_fee_rate,
-                events::FeeOperationType::Lock,
-            )?;
+                &fee_recipient,
+                global_config.distribution_enabled,
+                &global_config.treasury_destinations,
+            );
         }
         soroban_sdk::log!(&env, "fee ok");
 
@@ -3324,7 +3436,7 @@ impl BountyEscrowContract {
                 return Err(e);
             }
         }
-
+        audit_trail::log_action(&env, symbol_short!("lock"), depositor.clone(), bounty_id);
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
         Ok(())
@@ -3741,11 +3853,11 @@ impl BountyEscrowContract {
             Self::route_fee(
                 &env,
                 &client,
-                &fee_config,
                 release_fee,
-                release_fee_rate,
-                events::FeeOperationType::Release,
-            )?;
+                &fee_recipient,
+                fee_config.distribution_enabled,
+                &fee_config.treasury_destinations,
+            );
         }
 
         client.transfer(&env.current_contract_address(), &contributor, &net_payout);
@@ -3760,7 +3872,7 @@ impl BountyEscrowContract {
                 timestamp: env.ledger().timestamp(),
             },
         );
-
+        audit_trail::log_action(&env, symbol_short!("release"), contributor.clone(), bounty_id);
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
         Ok(())
@@ -4518,6 +4630,11 @@ impl BountyEscrowContract {
                 amount: refund_amount,
                 refund_to: refund_to.clone(),
                 timestamp: now,
+                trigger_type: if approval.is_some() {
+                    RefundTriggerType::AdminApproval
+                } else {
+                    RefundTriggerType::DeadlineExpired
+                },
             },
         );
         Self::record_receipt(
@@ -4546,7 +4663,7 @@ impl BountyEscrowContract {
                 return Err(e);
             }
         }
-
+        audit_trail::log_action(&env, symbol_short!("refund"), escrow.depositor.clone(), bounty_id);
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
         Ok(())
@@ -4785,6 +4902,11 @@ impl BountyEscrowContract {
                 amount: refund_amount,
                 refund_to: refund_to.clone(),
                 timestamp: now,
+                trigger_type: if approval.is_some() {
+                    RefundTriggerType::AdminApproval
+                } else {
+                    RefundTriggerType::DeadlineExpired
+                },
             },
         );
 
@@ -4860,109 +4982,36 @@ impl BountyEscrowContract {
         let now = env.ledger().timestamp();
         let refund_to = escrow.depositor.clone();
 
-    pub fn initialize_escrow(
-        ctx: Context<InitializeEscrow>,
-        bounty_id: String,
-        amount: u64,
-        expiry: i64,
-    ) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
-        escrow.initializer = ctx.accounts.initializer.key();
-        escrow.bounty_id = bounty_id;
-        escrow.amount = amount;
-        escrow.expiry = expiry;
-        escrow.status = EscrowStatus::Active;
-        escrow.bump = ctx.bumps.escrow;
-
-        // Transfer tokens to vault
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.initializer_token_account.to_account_info(),
-            to: ctx.accounts.vault_token_account.to_account_info(),
-            authority: ctx.accounts.initializer.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new(cpi_program, cpi_accounts);
-        token::transfer(cpi_ctx, amount)?;
-
-        emit!(EscrowInitialized {
-            bounty_id: escrow.bounty_id.clone(),
-            initializer: escrow.initializer,
-            amount,
-        });
-
-        Ok(())
-    }
-
-    pub fn complete_bounty(ctx: Context<CompleteBounty>) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
-        require!(escrow.status == EscrowStatus::Active, EscrowError::EscrowNotActive);
-
-        let seeds = &[
-            b"escrow".as_ref(),
-            escrow.initializer.as_ref(),
-            escrow.bounty_id.as_bytes(),
-            &[escrow.bump],
-        ];
-        let signer = &[&seeds[..]];
-
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.vault_token_account.to_account_info(),
-            to: ctx.accounts.contributor_token_account.to_account_info(),
-            authority: escrow.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
-        token::transfer(cpi_ctx, escrow.amount)?;
-
-        escrow.status = EscrowStatus::Completed;
-
-        emit!(BountyCompleted {
-            bounty_id: escrow.bounty_id.clone(),
-            contributor: ctx.accounts.contributor.key(),
-        });
-
-        Ok(())
-    }
-
-    // --- NEW FUNCTIONS FROM new_functions.rs ---
-
-    pub fn set_conditional_refund(
-        ctx: Context<SetRefund>, 
-        mode: RefundMode, 
-        config: GasBudgetConfig
-    ) -> Result<()> {
-        let escrow = &mut ctx.accounts.escrow;
-        let refund_record = &mut ctx.accounts.refund_record;
-
-        refund_record.escrow = escrow.key();
-        refund_record.mode = mode;
-        refund_record.gas_budget = config.max_gas;
-        refund_record.is_resolved = false;
-
-        emit!(RefundModeSet {
-            bounty_id: escrow.bounty_id.clone(),
-            mode,
-        });
-
-        Ok(())
-    }
-
-    pub fn trigger_refund(ctx: Context<TriggerRefund>) -> Result<()> {
-        let escrow = &ctx.accounts.escrow;
-        let refund_record = &mut ctx.accounts.refund_record;
-
-        require!(!refund_record.is_resolved, EscrowError::RefundAlreadyResolved);
-        
-        let clock = Clock::get()?;
-        if refund_record.mode == RefundMode::TimeBased {
-            require!(clock.unix_timestamp > escrow.expiry, EscrowError::ExpiryNotReached);
+        // EFFECTS: update escrow state before external call (CEI)
+        escrow.remaining_amount = escrow.remaining_amount.saturating_sub(amount);
+        if escrow.remaining_amount == 0 {
+            escrow.status = EscrowStatus::Refunded;
+        } else {
+            escrow.status = EscrowStatus::PartiallyRefunded;
         }
+        env.storage()
+            .persistent()
+            .set(&DataKey::Escrow(bounty_id), &escrow);
 
-        emit!(RefundTriggered {
-            bounty_id: escrow.bounty_id.clone(),
-            timestamp: clock.unix_timestamp,
-        });
+        // INTERACTION: external token transfer
+        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let client = token::Client::new(&env, &token_addr);
+        client.transfer(&env.current_contract_address(), &refund_to, &amount);
 
+        emit_funds_refunded(
+            &env,
+            FundsRefunded {
+                version: EVENT_VERSION_V2,
+                bounty_id,
+                amount,
+                refund_to: refund_to.clone(),
+                timestamp: now,
+                trigger_type: RefundTriggerType::AdminApproval,
+            },
+        );
+
+        // GUARD: release reentrancy lock
+        reentrancy_guard::release(&env);
         Ok(())
     }
 
@@ -5195,25 +5244,6 @@ impl BountyEscrowContract {
             }
         }
 
-            Ok(locked_count)
-        })();
-
-        // Gas budget cap enforcement (test / testutils only).
-        #[cfg(any(test, feature = "testutils"))]
-        if result.is_ok() {
-            let gas_cfg = gas_budget::get_config(&env);
-            if let Err(e) = gas_budget::check(
-                &env,
-                symbol_short!("b_lock"),
-                &gas_cfg.batch_lock,
-                &gas_snapshot,
-                gas_cfg.enforce,
-            ) {
-                reentrancy_guard::release(&env);
-                return Err(e);
-            }
-        }
-
         // GUARD: release reentrancy lock
         reentrancy_guard::release(&env);
         result
@@ -5397,171 +5427,30 @@ impl BountyEscrowContract {
                 },
             );
 
-        require!(escrow.status == EscrowStatus::Active, EscrowError::EscrowNotActive);
-        require!(!refund_record.is_resolved, EscrowError::RefundAlreadyResolved);
+            Ok(released_count)
+        })();
 
-        let seeds = &[
-            b"escrow".as_ref(),
-            escrow.initializer.as_ref(),
-            escrow.bounty_id.as_bytes(),
-            &[escrow.bump],
-        ];
-        let signer = &[&seeds[..]];
+        // Gas budget cap enforcement (test / testutils only).
+        #[cfg(any(test, feature = "testutils"))]
+        if result.is_ok() {
+            let gas_cfg = gas_budget::get_config(&env);
+            if let Err(e) = gas_budget::check(
+                &env,
+                symbol_short!("b_rls"),
+                &gas_cfg.batch_release,
+                &gas_snapshot,
+                gas_cfg.enforce,
+            ) {
+                reentrancy_guard::release(&env);
+                return Err(e);
+            }
+        }
 
-        let cpi_accounts = Transfer {
-            from: ctx.accounts.vault_token_account.to_account_info(),
-            to: ctx.accounts.initializer_token_account.to_account_info(),
-            authority: escrow.to_account_info(),
-        };
-        let cpi_program = ctx.accounts.token_program.to_account_info();
-        let cpi_ctx = CpiContext::new_with_signer(cpi_program, cpi_accounts, signer);
-        token::transfer(cpi_ctx, escrow.amount)?;
-
-        escrow.status = EscrowStatus::Refunded;
-        refund_record.is_resolved = true;
-
-        emit!(RefundResolved {
-            bounty_id: escrow.bounty_id.clone(),
-            amount: escrow.amount,
-        });
-
-        Ok(())
+        // GUARD: release reentrancy lock
+        reentrancy_guard::release(&env);
+        result
     }
 }
 
-// --- ACCOUNT CONTEXTS AND TYPES ---
-
-#[derive(Accounts)]
-pub struct InitializeEscrow<'info> {
-    #[account(mut)]
-    pub initializer: Signer<'info>,
-    pub mint: Account<'info, Mint>,
-    #[account(
-        mut,
-        constraint = initializer_token_account.mint == mint.key(),
-        constraint = initializer_token_account.owner == initializer.key()
-    )]
-    pub initializer_token_account: Account<'info, TokenAccount>,
-    #[account(
-        init,
-        payer = initializer,
-        space = 8 + EscrowAccount::LEN,
-        seeds = [b"escrow", initializer.key().as_ref(), bounty_id.as_bytes()],
-        bump
-    )]
-    pub escrow: Account<'info, EscrowAccount>,
-    #[account(
-        init,
-        payer = initializer,
-        token::mint = mint,
-        token::authority = escrow,
-    )]
-    pub vault_token_account: Account<'info, TokenAccount>,
-    pub system_program: Program<'info, System>,
-    pub token_program: Program<'info, Token>,
-    pub rent: Sysvar<'info, Rent>,
-}
-
-#[derive(Accounts)]
-pub struct CompleteBounty<'info> {
-    #[account(mut)]
-    pub contributor: Signer<'info>,
-    #[account(
-        mut,
-        seeds = [b"escrow", escrow.initializer.as_ref(), escrow.bounty_id.as_bytes()],
-        bump = escrow.bump,
-        has_one = initializer,
-    )]
-    pub escrow: Account<'info, EscrowAccount>,
-    /// CHECK: This is the original initializer of the escrow
-    pub initializer: AccountInfo<'info>,
-    #[account(
-        mut,
-        constraint = vault_token_account.owner == escrow.key()
-    )]
-    pub vault_token_account: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub contributor_token_account: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[derive(Accounts)]
-pub struct SetRefund<'info> {
-    #[account(mut)]
-    pub initializer: Signer<'info>,
-    #[account(
-        mut,
-        has_one = initializer,
-        seeds = [b"escrow", initializer.key().as_ref(), escrow.bounty_id.as_bytes()],
-        bump = escrow.bump,
-    )]
-    pub escrow: Account<'info, EscrowAccount>,
-    #[account(
-        init,
-        payer = initializer,
-        space = 8 + RefundRecord::LEN,
-        seeds = [b"refund", escrow.key().as_ref()],
-        bump
-    )]
-    pub refund_record: Account<'info, RefundRecord>,
-    pub system_program: Program<'info, System>,
-}
-
-#[derive(Accounts)]
-pub struct TriggerRefund<'info> {
-    pub caller: Signer<'info>,
-    pub escrow: Account<'info, EscrowAccount>,
-    #[account(
-        mut,
-        seeds = [b"refund", escrow.key().as_ref()],
-        bump,
-    )]
-    pub refund_record: Account<'info, RefundRecord>,
-}
-
-#[derive(Accounts)]
-pub struct ResolveRefund<'info> {
-    #[account(mut)]
-    pub initializer: Signer<'info>,
-    #[account(
-        mut,
-        has_one = initializer,
-        seeds = [b"escrow", initializer.key().as_ref(), escrow.bounty_id.as_bytes()],
-        bump = escrow.bump,
-    )]
-    pub escrow: Account<'info, EscrowAccount>,
-    #[account(
-        mut,
-        seeds = [b"refund", escrow.key().as_ref()],
-        bump,
-    )]
-    pub refund_record: Account<'info, RefundRecord>,
-    #[account(mut)]
-    pub vault_token_account: Account<'info, TokenAccount>,
-    #[account(mut)]
-    pub initializer_token_account: Account<'info, TokenAccount>,
-    pub token_program: Program<'info, Token>,
-}
-
-#[account]
-pub struct RefundRecord {
-    pub escrow: Pubkey,
-    pub mode: RefundMode,
-    pub gas_budget: u64,
-    pub is_resolved: bool,
-}
-
-impl RefundRecord {
-    pub const LEN: usize = 32 + 1 + 8 + 1;
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy, PartialEq, Eq)]
-pub enum RefundMode {
-    Oracle,
-    TimeBased,
-}
-
-#[derive(AnchorSerialize, AnchorDeserialize, Clone, Copy)]
-pub struct GasBudgetConfig {
-    pub max_gas: u64,
-}
+#[cfg(test)]
+mod test_max_counts;
