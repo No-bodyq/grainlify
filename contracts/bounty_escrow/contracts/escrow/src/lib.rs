@@ -681,7 +681,7 @@ pub enum Error {
     /// Bounty exists but is not an anonymous escrow (for refund_resolved)
     NotAnonymousEscrow = 41,
     /// Use get_escrow_info_v2 for anonymous escrows
-    UseGetEscrowInfoV2ForAnonymous = 37,
+    UseEscrowInfoV2ForAnonymous = 37,
     InvalidSelectionInput = 42,
     /// Returned when an upgrade safety pre-check fails
     UpgradeSafetyCheckFailed = 43,

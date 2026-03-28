@@ -72,7 +72,7 @@ pub fn log_action(env: &Env, action: Symbol, actor: Address, target_id: u64) {
         target_id,
         timestamp,
     );
-    let new_hash = env.crypto().sha256(&payload.to_xdr(env));
+    let new_hash: BytesN<32> = env.crypto().sha256(&payload.to_xdr(env)).into();
 
     config.head_hash = new_hash;
 

@@ -19,7 +19,7 @@ This document describes the optional anonymization and pseudonymization of on-ch
 
 ### 2. Views
 
-- **`get_escrow_info(bounty_id)`**: For anonymous bounties returns `UseGetEscrowInfoV2ForAnonymous`. Use the v2 view instead.
+- **`get_escrow_info(bounty_id)`**: For anonymous bounties returns `UseEscrowInfoV2ForAnonymous`. Use the v2 view instead.
 - **`get_escrow_info_v2(bounty_id)`**: Returns `EscrowInfo` with `depositor: AnonymousParty`:
   - `AnonymousParty::Address(addr)` for normal escrows
   - `AnonymousParty::Commitment(BytesN<32>)` for anonymous escrows
@@ -66,7 +66,7 @@ This document describes the optional anonymization and pseudonymization of on-ch
 - `NotAnonymousResolver`: Caller is not the configured anonymous resolver.
 - `NotAnonymousEscrow`: `refund_resolved` was called for a non-anonymous bounty (use `refund` instead).
 - `AnonymousResolverNotSet`: No resolver configured; cannot call `refund_resolved`.
-- `UseGetEscrowInfoV2ForAnonymous`: Use `get_escrow_info_v2` for this bounty (depositor is a commitment).
+- `UseEscrowInfoV2ForAnonymous`: Use `get_escrow_info_v2` for this bounty (depositor is a commitment).
 
 ## Privacy and compliance notes
 

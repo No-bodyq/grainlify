@@ -85,7 +85,7 @@ var unifiedErrors = map[uint32]contractErrorEntry{
 	222: {"AnonymousRefundNeedsResolver", "Refund for anonymous escrow requires resolution"},
 	223: {"AnonymousResolverNotSet", "Anonymous resolver address not set"},
 	224: {"NotAnonymousEscrowVariant", "Escrow type mismatch: expected anonymous variant"},
-	225: {"UseGetEscrowInfoV2ForAnonymous", "Please use get_escrow_info_v2 for anonymous escrows"},
+	225: {"UseEscrowInfoV2ForAnonymous", "Please use get_escrow_info_v2 for anonymous escrows"},
 
 	// 300-399: Identity / KYC Errors
 	301: {"InvalidSignature", "Identity claim signature is invalid"},
