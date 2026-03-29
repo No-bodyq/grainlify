@@ -191,9 +191,8 @@ pub const STORAGE_SCHEMA_VERSION: u32 = 1;
 pub const DELEGATE_PERMISSION_RELEASE: u32 = 1 << 0;
 pub const DELEGATE_PERMISSION_REFUND: u32 = 1 << 1;
 pub const DELEGATE_PERMISSION_UPDATE_META: u32 = 1 << 2;
-pub const DELEGATE_PERMISSION_MASK: u32 = DELEGATE_PERMISSION_RELEASE
-    | DELEGATE_PERMISSION_REFUND
-    | DELEGATE_PERMISSION_UPDATE_META;
+pub const DELEGATE_PERMISSION_MASK: u32 =
+    DELEGATE_PERMISSION_RELEASE | DELEGATE_PERMISSION_REFUND | DELEGATE_PERMISSION_UPDATE_META;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -419,6 +418,24 @@ pub struct ProgramMetadataUpdatedEvent {
 
 // Metadata structs moved to metadata.rs
 
+/// The lifecycle state of a program escrow.
+///
+/// Transitions:
+/// ```text
+/// Draft ──publish_program()──► Active
+/// ```
+///
+/// Programs are created in `Draft` state to allow preparation and review
+/// before becoming active and allowing fund locks and payouts.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ProgramStatus {
+    /// Initial state: program is being prepared, no locks or payouts allowed
+    Draft,
+    /// Active state: program is live, locks and payouts are allowed
+    Active,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct ProgramData {
@@ -436,6 +453,7 @@ pub struct ProgramData {
     pub reference_hash: Option<soroban_sdk::Bytes>,
     pub archived: bool,
     pub archived_at: Option<u64>,
+    pub status: ProgramStatus,
 }
 
 // ========================================================================
@@ -524,8 +542,7 @@ pub enum DataKey {
     ReadOnlyMode,                    // bool flag — blocks all state mutations
     ProgramDependencies(String),     // program_id -> Vec<String>
     DependencyStatus(String),        // program_id -> DependencyStatus
-    Dispute,  
-    SplitConfig(String),                       // DisputeRecord (single active dispute per contract)
+    Dispute,                         // DisputeRecord (single active dispute per contract)
 }
 
 #[contracttype]
@@ -745,6 +762,11 @@ pub enum BatchError {
 
 pub const MAX_BATCH_SIZE: u32 = 100;
 
+// Constants for program scheduling
+const BASE_FEE: i128 = 100;
+const MIN_INCREMENT: u64 = 86400; // 1 day in seconds
+const MAX_SLOTS: usize = 1000;
+
 fn vec_contains(values: &Vec<String>, target: &String) -> bool {
     for value in values.iter() {
         if value == *target {
@@ -842,7 +864,6 @@ mod test_read_only_mode;
 
 #[cfg(test)]
 mod test_risk_flags;
-#[cfg(test)]
 // mod test_serialization_compatibility;
 #[cfg(test)]
 mod test_storage_layout;
@@ -1044,11 +1065,12 @@ impl ProgramEscrowContract {
                 tags: soroban_sdk::Vec::new(&env),
                 start_date: None,
                 end_date: None,
-                custom_fields: soroban_sdk::Map::new(&env),
+                custom_fields: soroban_sdk::Vec::new(&env),
             },
             reference_hash,
             archived: false,
             archived_at: None,
+            status: ProgramStatus::Draft,
         };
 
         // Store program data in registry
@@ -1195,102 +1217,50 @@ impl ProgramEscrowContract {
         );
 
         if let Some(program_metadata) = metadata {
-            program_data.metadata = Some(program_metadata);
+            program_data.metadata = program_metadata;
             Self::store_program_data(&env, &program_id, &program_data);
         }
 
         program_data
     }
 
-
-
     /// Get program metadata
     ///
     /// # Arguments
     /// * `program_id` - The program ID
     pub fn get_program_metadata(env: Env, program_id: String) -> ProgramMetadata {
-        let program: ProgramData = env.storage().instance().get(&DataKey::Program(program_id)).expect("Program not found");
-        program.metadata.unwrap_or_else(|| ProgramMetadata {
-            program_name: None,
-            program_type: None,
-            ecosystem: None,
-            tags: soroban_sdk::Vec::new(&env),
-            start_date: None,
-            end_date: None,
-            custom_fields: soroban_sdk::Vec::new(&env),
-        })
+        let program: ProgramData = env
+            .storage()
+            .instance()
+            .get(&DataKey::Program(program_id))
+            .expect("Program not found");
+        program.metadata
     }
 
     /// Query programs by type
-    pub fn query_programs_by_type(env: Env, program_type: String, start: u32, limit: u32) -> soroban_sdk::Vec<String> {
-        let registry: soroban_sdk::Vec<String> = env.storage().instance().get(&PROGRAM_REGISTRY).unwrap_or(soroban_sdk::Vec::new(&env));
+    pub fn query_programs_by_type(
+        env: Env,
+        program_type: String,
+        start: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<String> {
+        let registry: soroban_sdk::Vec<String> = env
+            .storage()
+            .instance()
+            .get(&PROGRAM_REGISTRY)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
         let mut result = soroban_sdk::Vec::new(&env);
         let mut count = 0;
         let mut skipped = 0;
 
         for id in registry.iter() {
-            if let Some(program) = env.storage().instance().get::<_, ProgramData>(&DataKey::Program(id.clone())) {
-                if let Some(meta) = program.metadata {
-                    if let Some(ptype) = meta.program_type {
-                        if ptype == program_type {
-                            if skipped < start {
-                                skipped += 1;
-                            } else if count < limit {
-                                result.push_back(id.clone());
-                                count += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        result
-    }
-
-    /// Query programs by ecosystem
-    pub fn query_programs_by_ecosystem(env: Env, ecosystem: String, start: u32, limit: u32) -> soroban_sdk::Vec<String> {
-        let registry: soroban_sdk::Vec<String> = env.storage().instance().get(&PROGRAM_REGISTRY).unwrap_or(soroban_sdk::Vec::new(&env));
-        let mut result = soroban_sdk::Vec::new(&env);
-        let mut count = 0;
-        let mut skipped = 0;
-
-        for id in registry.iter() {
-            if let Some(program) = env.storage().instance().get::<_, ProgramData>(&DataKey::Program(id.clone())) {
-                if let Some(meta) = program.metadata {
-                    if let Some(eco) = meta.ecosystem {
-                        if eco == ecosystem {
-                            if skipped < start {
-                                skipped += 1;
-                            } else if count < limit {
-                                result.push_back(id.clone());
-                                count += 1;
-                            }
-                        }
-                    }
-                }
-            }
-        }
-        result
-    }
-
-    /// Query programs by tag
-    pub fn query_programs_by_tag(env: Env, tag: String, start: u32, limit: u32) -> soroban_sdk::Vec<String> {
-        let registry: soroban_sdk::Vec<String> = env.storage().instance().get(&PROGRAM_REGISTRY).unwrap_or(soroban_sdk::Vec::new(&env));
-        let mut result = soroban_sdk::Vec::new(&env);
-        let mut count = 0;
-        let mut skipped = 0;
-
-        for id in registry.iter() {
-            if let Some(program) = env.storage().instance().get::<_, ProgramData>(&DataKey::Program(id.clone())) {
-                if let Some(meta) = program.metadata {
-                    let mut has_tag = false;
-                    for t in meta.tags.iter() {
-                        if t == tag {
-                            has_tag = true;
-                            break;
-                        }
-                    }
-                    if has_tag {
+            if let Some(program) = env
+                .storage()
+                .instance()
+                .get::<_, ProgramData>(&DataKey::Program(id.clone()))
+            {
+                if let Some(ptype) = program.metadata.program_type {
+                    if ptype == program_type {
                         if skipped < start {
                             skipped += 1;
                         } else if count < limit {
@@ -1304,7 +1274,84 @@ impl ProgramEscrowContract {
         result
     }
 
+    /// Query programs by ecosystem
+    pub fn query_programs_by_ecosystem(
+        env: Env,
+        ecosystem: String,
+        start: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<String> {
+        let registry: soroban_sdk::Vec<String> = env
+            .storage()
+            .instance()
+            .get(&PROGRAM_REGISTRY)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        let mut result = soroban_sdk::Vec::new(&env);
+        let mut count = 0;
+        let mut skipped = 0;
 
+        for id in registry.iter() {
+            if let Some(program) = env
+                .storage()
+                .instance()
+                .get::<_, ProgramData>(&DataKey::Program(id.clone()))
+            {
+                if let Some(eco) = program.metadata.ecosystem {
+                    if eco == ecosystem {
+                        if skipped < start {
+                            skipped += 1;
+                        } else if count < limit {
+                            result.push_back(id.clone());
+                            count += 1;
+                        }
+                    }
+                }
+            }
+        }
+        result
+    }
+
+    /// Query programs by tag
+    pub fn query_programs_by_tag(
+        env: Env,
+        tag: String,
+        start: u32,
+        limit: u32,
+    ) -> soroban_sdk::Vec<String> {
+        let registry: soroban_sdk::Vec<String> = env
+            .storage()
+            .instance()
+            .get(&PROGRAM_REGISTRY)
+            .unwrap_or(soroban_sdk::Vec::new(&env));
+        let mut result = soroban_sdk::Vec::new(&env);
+        let mut count = 0;
+        let mut skipped = 0;
+
+        for id in registry.iter() {
+            if let Some(program) = env
+                .storage()
+                .instance()
+                .get::<_, ProgramData>(&DataKey::Program(id.clone()))
+            {
+                let mut has_tag = false;
+                for t in program.metadata.tags.iter() {
+                    if t == tag {
+                        has_tag = true;
+                        break;
+                    }
+                }
+                if has_tag {
+                    if skipped < start {
+                        skipped += 1;
+                    } else if count < limit {
+                        result.push_back(id.clone());
+                        count += 1;
+                    }
+                }
+            }
+        }
+        result
+    }
 
     /// Batch-initialize multiple programs in one transaction (all-or-nothing).
     ///
@@ -1363,17 +1410,18 @@ impl ProgramEscrowContract {
                 initial_liquidity: 0,
                 risk_flags: 0,
                 metadata: ProgramMetadata {
-                program_name: None,
-                program_type: None,
-                ecosystem: None,
-                tags: soroban_sdk::Vec::new(&env),
-                start_date: None,
-                end_date: None,
-                custom_fields: soroban_sdk::Map::new(&env),
-            },
+                    program_name: None,
+                    program_type: None,
+                    ecosystem: None,
+                    tags: soroban_sdk::Vec::new(&env),
+                    start_date: None,
+                    end_date: None,
+                    custom_fields: soroban_sdk::Vec::new(&env),
+                },
                 reference_hash: item.reference_hash.clone(),
                 archived: false,
                 archived_at: None,
+                status: ProgramStatus::Draft,
             };
             let program_key = DataKey::Program(program_id.clone());
             env.storage().instance().set(&program_key, &program_data);
@@ -1570,7 +1618,7 @@ impl ProgramEscrowContract {
     fn lock_program_funds_internal(env: Env, amount: i128, from: Option<Address>) -> ProgramData {
         // Validation precedence (deterministic ordering):
         // 1. Contract initialized
-        // 2. Read-only mode
+        // 2. Program must be in Active status (not Draft)
         // 3. Paused (operational state)
         // 4. Input validation (amount)
 
@@ -1579,8 +1627,11 @@ impl ProgramEscrowContract {
             panic!("Program not initialized");
         }
 
-        // 2. Read-only mode
-        Self::require_not_read_only(&env);
+        // 2. Program must be published (not in Draft)
+        let program_data: ProgramData = env.storage().instance().get(&PROGRAM_DATA).unwrap();
+        if program_data.status == ProgramStatus::Draft {
+            panic!("Program is in Draft status. Publish the program first.");
+        }
 
         // 3. Operational state: paused
         if Self::check_paused(&env, symbol_short!("lock")) {
@@ -1696,7 +1747,7 @@ impl ProgramEscrowContract {
     }
 
     /// Returns the current admin address, if set.
-    pub fn get_admin(env: Env) -> Option<Address> {
+    pub fn get_program_admin(env: Env) -> Option<Address> {
         env.storage().instance().get(&DataKey::Admin)
     }
 
@@ -1934,11 +1985,12 @@ impl ProgramEscrowContract {
         metadata: ProgramMetadata,
     ) -> ProgramData {
         let mut program_data = Self::get_program_data_by_id(&env, &program_id);
-        
+
         // Authorization check: either the authorized payout key or a delegate with META permission
-        let has_meta_permission = (program_data.delegate_permissions & DELEGATE_PERMISSION_UPDATE_META) != 0;
+        let has_meta_permission =
+            (program_data.delegate_permissions & DELEGATE_PERMISSION_UPDATE_META) != 0;
         let is_delegate = program_data.delegate.as_ref() == Some(&caller);
-        
+
         if is_delegate && has_meta_permission {
             caller.require_auth();
         } else {
@@ -1951,7 +2003,7 @@ impl ProgramEscrowContract {
                 panic!("Program name cannot be empty if provided");
             }
         }
-        
+
         for tag in metadata.tags.iter() {
             if tag.len() == 0 {
                 panic!("tag cannot be empty");
@@ -1964,7 +2016,7 @@ impl ProgramEscrowContract {
             }
         }
 
-        program_data.metadata = Some(metadata);
+        program_data.metadata = metadata;
         Self::store_program_data(&env, &program_id, &program_data);
 
         // Emit updated event
@@ -2011,7 +2063,6 @@ impl ProgramEscrowContract {
 
         program_data
     }
-
 
     /// Set risk flags for a program (admin only).
     pub fn set_program_risk_flags(env: Env, program_id: String, flags: u32) -> ProgramData {
@@ -2397,7 +2448,7 @@ impl ProgramEscrowContract {
             })
     }
 
-    pub fn get_analytics(_env: Env) -> Analytics {
+    pub fn get_program_analytics(_env: Env) -> Analytics {
         Analytics {
             total_locked: 0,
             total_released: 0,
@@ -4031,7 +4082,6 @@ impl ProgramEscrowContract {
 
 #[cfg(test)]
 // mod rbac_tests;
-
 #[cfg(test)]
 mod test_metadata_tagging;
 

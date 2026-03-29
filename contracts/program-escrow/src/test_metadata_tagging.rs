@@ -83,7 +83,10 @@ fn test_program_metadata_set_on_creation() {
     );
 
     let retrieved = s.escrow.get_program_metadata(&program_id);
-    assert_eq!(retrieved.program_name, Some(String::from_str(&s.env, "Hackathon")));
+    assert_eq!(
+        retrieved.program_name,
+        Some(String::from_str(&s.env, "Hackathon"))
+    );
 }
 
 #[test]
@@ -91,7 +94,14 @@ fn test_program_metadata_update() {
     let s = Setup::new();
     let program_id = String::from_str(&s.env, "UpdateTest");
 
-    s.escrow.init_program_with_metadata(&program_id, &s.backend, &s.token.address, &s.organizer, &None, &None);
+    s.escrow.init_program_with_metadata(
+        &program_id,
+        &s.backend,
+        &s.token.address,
+        &s.organizer,
+        &None,
+        &None,
+    );
 
     let metadata = ProgramMetadata {
         program_name: Some(String::from_str(&s.env, "Updated")),
@@ -105,5 +115,8 @@ fn test_program_metadata_update() {
 
     s.escrow.update_program_metadata(&program_id, &metadata);
     let retrieved = s.escrow.get_program_metadata(&program_id);
-    assert_eq!(retrieved.program_name, Some(String::from_str(&s.env, "Updated")));
+    assert_eq!(
+        retrieved.program_name,
+        Some(String::from_str(&s.env, "Updated"))
+    );
 }
