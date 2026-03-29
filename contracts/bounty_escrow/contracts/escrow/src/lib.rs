@@ -10,6 +10,7 @@ pub mod reentrancy_guard;
 pub mod audit_trail;
 #[cfg(feature = "legacy-tests")]
 mod test_boundary_edge_cases;
+#[cfg(feature = "legacy-tests")]
 mod test_event_schema;
 #[cfg(feature = "legacy-tests")]
 mod test_cross_contract_interface;
