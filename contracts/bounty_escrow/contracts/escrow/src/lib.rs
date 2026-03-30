@@ -34,18 +34,13 @@ mod test_timelock;
 
 use crate::events::{
     emit_admin_action_cancelled, emit_admin_action_executed, emit_admin_action_proposed,
-    emit_batch_funds_locked, emit_batch_funds_released, emit_bounty_initialized,
-    emit_deprecation_state_changed, emit_deterministic_selection, emit_escrow_published,
-    emit_funds_locked, emit_funds_locked_anon, emit_funds_refunded, emit_funds_released,
-    emit_maintenance_mode_changed, emit_notification_preferences_updated,
-    emit_participant_filter_mode_changed, emit_risk_flags_updated, emit_ticket_claimed,
-    emit_ticket_issued, emit_timelock_configured, AdminActionCancelled, AdminActionExecuted,
-    AdminActionProposed, BatchFundsLocked, BatchFundsReleased, BountyEscrowInitialized,
-    ClaimCancelled, ClaimCreated, ClaimExecuted, CriticalOperationOutcome, DeprecationStateChanged,
-    DeterministicSelectionDerived, EscrowPublished, FundsLocked, FundsLockedAnon, FundsRefunded,
-    FundsReleased, MaintenanceModeChanged, NotificationPreferencesUpdated,
-    ParticipantFilterModeChanged, RefundTriggerType, RiskFlagsUpdated, TicketClaimed, TicketIssued,
-    TimelockConfigured, EVENT_VERSION_V2,
+    emit_batch_funds_locked, emit_batch_funds_released, emit_deprecation_state_changed,
+    emit_escrow_published, emit_funds_locked, emit_funds_locked_anon, emit_funds_refunded,
+    emit_funds_released, emit_timelock_configured, AdminActionCancelled, AdminActionExecuted,
+    AdminActionProposed, BatchFundsLocked, BatchFundsReleased, ClaimCancelled, ClaimCreated,
+    ClaimExecuted, CriticalOperationOutcome, DeprecationStateChanged, EscrowPublished,
+    FundsLocked, FundsLockedAnon, FundsRefunded, FundsReleased, MaintenanceModeChanged,
+    RefundTriggerType, TimelockConfigured, EVENT_VERSION_V2,
 };
 use soroban_sdk::xdr::{FromXdr, ToXdr};
 use soroban_sdk::{
@@ -53,247 +48,7 @@ use soroban_sdk::{
     BytesN, Env, String, Symbol, Vec,
 };
 
-// ============================================================================
-// INPUT VALIDATION MODULE
-// ============================================================================
 
-/// Validation rules for human-readable identifiers to prevent malicious or confusing inputs.
-///
-/// This module provides consistent validation across all contracts for:
-/// - Bounty types and metadata
-/// - Any user-provided string identifiers
-///
-/// Rules enforced:
-/// - Maximum length limits to prevent UI/log issues
-/// - Allowed character sets (alphanumeric, spaces, safe punctuation)
-/// - No control characters that could cause display issues
-/// - No leading/trailing whitespace
-mod validation {
-    use soroban_sdk::Env;
-
-    /// Maximum length for bounty types and short identifiers
-    const MAX_TAG_LEN: u32 = 50;
-
-    /// Validates a tag, type, or short identifier.
-    ///
-    /// # Arguments
-    /// * `env` - The contract environment
-    /// * `tag` - The tag string to validate
-    /// * `field_name` - Name of the field for error messages
-    ///
-    /// # Panics
-    /// Panics if validation fails with a descriptive error message.
-    pub fn validate_tag(_env: &Env, tag: &soroban_sdk::String, field_name: &str) {
-        if tag.len() > MAX_TAG_LEN {
-            panic!(
-                "{} exceeds maximum length of {} characters",
-                field_name, MAX_TAG_LEN
-            );
-        }
-
-        // Tags should not be empty if provided
-        if tag.len() == 0 {
-            panic!("{} cannot be empty", field_name);
-        }
-        // Additional character validation can be added when SDK supports it
-    }
-}
-
-mod monitoring {
-    use soroban_sdk::{contracttype, symbol_short, Address, Env, String, Symbol};
-
-    // Storage keys
-    #[allow(dead_code)]
-    const OPERATION_COUNT: &str = "op_count";
-    #[allow(dead_code)]
-    const USER_COUNT: &str = "usr_count";
-    #[allow(dead_code)]
-    const ERROR_COUNT: &str = "err_count";
-
-    // Event: Operation metric
-    #[contracttype]
-    #[derive(Clone, Debug)]
-    pub struct OperationMetric {
-        pub operation: Symbol,
-        pub caller: Address,
-        pub timestamp: u64,
-        pub success: bool,
-    }
-
-    // Event: Performance metric
-    #[contracttype]
-    #[derive(Clone, Debug)]
-    pub struct PerformanceMetric {
-        pub function: Symbol,
-        pub duration: u64,
-        pub timestamp: u64,
-    }
-
-    // Data: Health status
-    #[contracttype]
-    #[derive(Clone, Debug)]
-    pub struct HealthStatus {
-        pub is_healthy: bool,
-        pub last_operation: u64,
-        pub total_operations: u64,
-        pub contract_version: String,
-    }
-
-    // Data: Analytics
-    #[contracttype]
-    #[derive(Clone, Debug)]
-    pub struct Analytics {
-        pub operation_count: u64,
-        pub unique_users: u64,
-        pub error_count: u64,
-        pub error_rate: u32,
-    }
-
-    // Data: State snapshot
-    #[contracttype]
-    #[derive(Clone, Debug)]
-    pub struct StateSnapshot {
-        pub timestamp: u64,
-        pub total_operations: u64,
-        pub total_users: u64,
-        pub total_errors: u64,
-    }
-
-    // Data: Performance stats
-    #[contracttype]
-    #[derive(Clone, Debug)]
-    pub struct PerformanceStats {
-        pub function_name: Symbol,
-        pub call_count: u64,
-        pub total_time: u64,
-        pub avg_time: u64,
-        pub last_called: u64,
-    }
-
-    // Track operation
-    #[allow(dead_code)]
-    pub fn track_operation(env: &Env, operation: Symbol, caller: Address, success: bool) {
-        let key = Symbol::new(env, OPERATION_COUNT);
-        let count: u64 = env.storage().persistent().get(&key).unwrap_or(0);
-        env.storage().persistent().set(&key, &(count + 1));
-
-        if !success {
-            let err_key = Symbol::new(env, ERROR_COUNT);
-            let err_count: u64 = env.storage().persistent().get(&err_key).unwrap_or(0);
-            env.storage().persistent().set(&err_key, &(err_count + 1));
-        }
-
-        env.events().publish(
-            (symbol_short!("metric"), symbol_short!("op")),
-            OperationMetric {
-                operation,
-                caller,
-                timestamp: env.ledger().timestamp(),
-                success,
-            },
-        );
-    }
-
-    // Track performance
-    #[allow(dead_code)]
-    pub fn emit_performance(env: &Env, function: Symbol, duration: u64) {
-        let count_key = (Symbol::new(env, "perf_cnt"), function.clone());
-        let time_key = (Symbol::new(env, "perf_time"), function.clone());
-
-        let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        let total: u64 = env.storage().persistent().get(&time_key).unwrap_or(0);
-
-        env.storage().persistent().set(&count_key, &(count + 1));
-        env.storage()
-            .persistent()
-            .set(&time_key, &(total + duration));
-
-        env.events().publish(
-            (symbol_short!("metric"), symbol_short!("perf")),
-            PerformanceMetric {
-                function,
-                duration,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-    }
-
-    // Health check
-    #[allow(dead_code)]
-    pub fn health_check(env: &Env) -> HealthStatus {
-        let key = Symbol::new(env, OPERATION_COUNT);
-        let ops: u64 = env.storage().persistent().get(&key).unwrap_or(0);
-
-        HealthStatus {
-            is_healthy: true,
-            last_operation: env.ledger().timestamp(),
-            total_operations: ops,
-            contract_version: String::from_str(env, "1.0.0"),
-        }
-    }
-
-    // Get analytics
-    #[allow(dead_code)]
-    pub fn get_escrow_analytics(env: &Env) -> Analytics {
-        let op_key = Symbol::new(env, OPERATION_COUNT);
-        let usr_key = Symbol::new(env, USER_COUNT);
-        let err_key = Symbol::new(env, ERROR_COUNT);
-
-        let ops: u64 = env.storage().persistent().get(&op_key).unwrap_or(0);
-        let users: u64 = env.storage().persistent().get(&usr_key).unwrap_or(0);
-        let errors: u64 = env.storage().persistent().get(&err_key).unwrap_or(0);
-
-        let error_rate = if ops > 0 {
-            ((errors as u128 * 10000) / ops as u128) as u32
-        } else {
-            0
-        };
-
-        Analytics {
-            operation_count: ops,
-            unique_users: users,
-            error_count: errors,
-            error_rate,
-        }
-    }
-
-    // Get state snapshot
-    #[allow(dead_code)]
-    pub fn get_state_snapshot(env: &Env) -> StateSnapshot {
-        let op_key = Symbol::new(env, OPERATION_COUNT);
-        let usr_key = Symbol::new(env, USER_COUNT);
-        let err_key = Symbol::new(env, ERROR_COUNT);
-
-        StateSnapshot {
-            timestamp: env.ledger().timestamp(),
-            total_operations: env.storage().persistent().get(&op_key).unwrap_or(0),
-            total_users: env.storage().persistent().get(&usr_key).unwrap_or(0),
-            total_errors: env.storage().persistent().get(&err_key).unwrap_or(0),
-        }
-    }
-
-    // Get performance stats
-    #[allow(dead_code)]
-    pub fn get_performance_stats(env: &Env, function_name: Symbol) -> PerformanceStats {
-        let count_key = (Symbol::new(env, "perf_cnt"), function_name.clone());
-        let time_key = (Symbol::new(env, "perf_time"), function_name.clone());
-        let last_key = (Symbol::new(env, "perf_last"), function_name.clone());
-
-        let count: u64 = env.storage().persistent().get(&count_key).unwrap_or(0);
-        let total: u64 = env.storage().persistent().get(&time_key).unwrap_or(0);
-        let last: u64 = env.storage().persistent().get(&last_key).unwrap_or(0);
-
-        let avg = if count > 0 { total / count } else { 0 };
-
-        PerformanceStats {
-            function_name,
-            call_count: count,
-            total_time: total,
-            avg_time: avg,
-            last_called: last,
-        }
-    }
-}
 
 mod anti_abuse {
     use soroban_sdk::{contracttype, symbol_short, Address, Env};
@@ -528,9 +283,6 @@ const DEFAULT_DELAY: u64 = 86_400;
 /// Maximum timelock delay in seconds (30 days)
 const MAX_DELAY: u64 = 2_592_000;
 
-extern crate grainlify_core;
-use grainlify_core::asset;
-use grainlify_core::pseudo_randomness;
 
 #[contracttype]
 #[derive(Copy, Clone, Debug, Eq, PartialEq)]
@@ -668,6 +420,7 @@ pub enum Error {
     DelayAboveMaximum = 55,
     InvalidState = 56,
     UpgradeSafetyFailed = 43,
+    GasBudgetExceeded = 44,
 }
 
 /// Bit flag: escrow or payout should be treated as elevated risk (indexers, UIs).
@@ -1105,17 +858,11 @@ pub struct BountyEscrowContract;
 
 #[contractimpl]
 impl BountyEscrowContract {
-    pub fn health_check(env: Env) -> monitoring::HealthStatus {
-        monitoring::health_check(&env)
+    /// Get the current admin address (view function)
+    pub fn get_admin(env: Env) -> Option<Address> {
+        env.storage().instance().get(&DataKey::Admin)
     }
 
-    pub fn get_escrow_analytics_v2(env: Env) -> monitoring::Analytics {
-        monitoring::get_escrow_analytics(&env)
-    }
-
-    pub fn get_state_snapshot(env: Env) -> monitoring::StateSnapshot {
-        monitoring::get_state_snapshot(&env)
-    }
     /// Enable or disable the on-chain append-only audit log (Admin only).
     pub fn set_audit_enabled(env: Env, enabled: bool) -> Result<(), Error> {
         let admin: Address = env
@@ -3115,7 +2862,7 @@ impl BountyEscrowContract {
     ///
     /// Precedence: `TokenFeeConfig(token)` > global `FeeConfig`.
     fn resolve_fee_config(env: &Env) -> (i128, i128, i128, i128, Address, bool) {
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_addr = env.storage().instance().get::<DataKey, Address>(&DataKey::Token).unwrap();
         if let Some(tok_cfg) = env
             .storage()
             .instance()
@@ -3261,10 +3008,7 @@ impl BountyEscrowContract {
         amount: i128,
         deadline: u64,
     ) -> Result<(), Error> {
-        let res =
-            Self::lock_funds_logic(env.clone(), depositor.clone(), bounty_id, amount, deadline);
-        monitoring::track_operation(&env, symbol_short!("lock"), depositor, res.is_ok());
-        res
+        Self::lock_funds_logic(env, depositor, bounty_id, amount, deadline)
     }
 
     fn lock_funds_logic(
@@ -3345,7 +3089,7 @@ impl BountyEscrowContract {
         }
         soroban_sdk::log!(&env, "bounty exists ok");
 
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_addr = env.storage().instance().get::<DataKey, Address>(&DataKey::Token).unwrap();
         let client = token::Client::new(&env, &token_addr);
         soroban_sdk::log!(&env, "token client ok");
 
@@ -3359,7 +3103,7 @@ impl BountyEscrowContract {
             _release_fee_rate,
             lock_fixed_fee,
             _release_fixed,
-            fee_recipient,
+            _fee_recipient,
             fee_enabled,
         ) = Self::resolve_fee_config(&env);
 
@@ -3758,14 +3502,12 @@ impl BountyEscrowContract {
     /// # Security
     /// Reentrancy guard is always cleared before any explicit error return after acquisition.
     pub fn publish(env: Env, bounty_id: u64) -> Result<(), Error> {
-        let caller = env
+        let _caller = env
             .storage()
             .instance()
             .get::<DataKey, Address>(&DataKey::Admin)
             .expect("Admin not set");
-        let res = Self::publish_logic(env.clone(), bounty_id, caller.clone());
-        monitoring::track_operation(&env, symbol_short!("publish"), caller, res.is_ok());
-        res
+        Self::publish_logic(env, bounty_id, _caller)
     }
 
     fn publish_logic(env: Env, bounty_id: u64, publisher: Address) -> Result<(), Error> {
@@ -3820,9 +3562,7 @@ impl BountyEscrowContract {
             .instance()
             .get::<DataKey, Address>(&DataKey::Admin)
             .unwrap_or(contributor.clone());
-        let res = Self::release_funds_logic(env.clone(), bounty_id, contributor);
-        monitoring::track_operation(&env, symbol_short!("release"), caller, res.is_ok());
-        res
+        Self::release_funds_logic(env, bounty_id, contributor)
     }
 
     fn release_funds_logic(env: Env, bounty_id: u64, contributor: Address) -> Result<(), Error> {
@@ -3916,7 +3656,7 @@ impl BountyEscrowContract {
             .set(&DataKey::Escrow(bounty_id), &escrow);
 
         // INTERACTION: external token transfers are last
-        let token_addr: Address = env.storage().instance().get(&DataKey::Token).unwrap();
+        let token_addr = env.storage().instance().get::<DataKey, Address>(&DataKey::Token).unwrap();
         let client = token::Client::new(&env, &token_addr);
 
         if release_fee > 0 {
@@ -4371,7 +4111,7 @@ impl BountyEscrowContract {
     pub fn cancel_pending_claim(
         env: Env,
         bounty_id: u64,
-        outcome: DisputeOutcome,
+        _outcome: DisputeOutcome,
     ) -> Result<(), Error> {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
