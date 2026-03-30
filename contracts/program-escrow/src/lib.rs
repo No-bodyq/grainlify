@@ -762,6 +762,30 @@ pub struct TimeWeightedMetrics {
     pub settlement_count: u64,
 }
 
+// Event symbol for payout key rotation
+const PAYOUT_KEY_ROTATED: Symbol = symbol_short!("KeyRot");
+
+/// Event emitted when the authorized payout key is rotated for a program.
+///
+/// Integrators should listen for this event and update any cached key references
+/// immediately — the old key is invalidated as soon as this event is emitted.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PayoutKeyRotatedEvent {
+    /// Schema version for forward-compatibility.
+    pub version: u32,
+    /// The program whose payout key was rotated.
+    pub program_id: String,
+    /// The address that authorized the rotation (admin or current payout key).
+    pub rotated_by: Address,
+    /// The new authorized payout key.
+    pub new_key: Address,
+    /// Monotonic nonce at the time of rotation (replay protection).
+    pub nonce: u64,
+    /// Ledger timestamp of the rotation.
+    pub rotated_at: u64,
+}
+
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub enum DataKey {
@@ -4289,7 +4313,137 @@ impl ProgramEscrowContract {
         env.storage().instance().get(&DataKey::Dispute)
     }
 
-    /// Get reputation metrics for the current program.
+    // ========================================================================
+    // Payout Key Rotation
+    // ========================================================================
+
+    /// Rotate the authorized payout key for a program.
+    ///
+    /// ## Authorization
+    ///
+    /// Only two principals may call this function:
+    /// - The **current** `authorized_payout_key` of the program, OR
+    /// - The **contract admin** (set via `initialize_contract` / `set_admin`).
+    ///
+    /// Both callers must satisfy `require_auth()` — i.e. the transaction must
+    /// carry a valid signature from the authorizing address.
+    ///
+    /// ## Replay Protection
+    ///
+    /// A per-program monotonic `nonce` is stored on-chain.  The caller must
+    /// supply the **current** nonce value; the contract increments it atomically
+    /// before writing the new key.  This prevents replayed rotation transactions
+    /// from a compromised key from being re-submitted on a different ledger.
+    ///
+    /// ## Old-Key Invalidation
+    ///
+    /// The old key is invalidated **immediately** upon successful rotation.
+    /// Any in-flight transaction signed by the old key that has not yet been
+    /// included in a ledger will be rejected once this rotation is confirmed.
+    ///
+    /// ## Timelock
+    ///
+    /// No timelock is enforced at the contract level.  If a product-level
+    /// timelock is desired, it should be implemented in the off-chain
+    /// orchestration layer before submitting the rotation transaction.
+    ///
+    /// ## Arguments
+    ///
+    /// - `program_id`  — The program whose key is being rotated.
+    /// - `caller`      — The address authorizing the rotation (must be current
+    ///                   payout key or admin).
+    /// - `new_key`     — The replacement authorized payout key.
+    /// - `nonce`       — The current on-chain nonce (must match exactly).
+    ///
+    /// ## Panics
+    ///
+    /// - `"Program not found"` — `program_id` does not exist.
+    /// - `"Unauthorized"` — `caller` is neither the current payout key nor admin.
+    /// - `"Invalid nonce"` — supplied nonce does not match the stored nonce.
+    /// - `"New key must differ from current key"` — rotating to the same address
+    ///   is a no-op and is rejected to prevent accidental misuse.
+    ///
+    /// ## Events
+    ///
+    /// Emits `PayoutKeyRotatedEvent` on success.
+    pub fn rotate_payout_key(
+        env: Env,
+        program_id: String,
+        caller: Address,
+        new_key: Address,
+        nonce: u64,
+    ) -> ProgramData {
+        // 1. Load program — panics if not found.
+        let mut program_data = Self::get_program_data_by_id(&env, &program_id);
+
+        // 2. Authorize: caller must be current payout key or contract admin.
+        caller.require_auth();
+
+        let is_current_key = caller == program_data.authorized_payout_key;
+        let is_admin = env
+            .storage()
+            .instance()
+            .get::<_, Address>(&DataKey::Admin)
+            .map(|admin| admin == caller)
+            .unwrap_or(false);
+
+        if !is_current_key && !is_admin {
+            panic!("Unauthorized");
+        }
+
+        // 3. Replay protection: nonce must match stored value.
+        let stored_nonce: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::RotationNonce(program_id.clone()))
+            .unwrap_or(0u64);
+
+        if nonce != stored_nonce {
+            panic!("Invalid nonce");
+        }
+
+        // 4. Guard against no-op rotation.
+        if new_key == program_data.authorized_payout_key {
+            panic!("New key must differ from current key");
+        }
+
+        // 5. Atomically increment nonce before mutating state (prevents replay
+        //    even if the transaction is somehow re-submitted).
+        env.storage()
+            .instance()
+            .set(&DataKey::RotationNonce(program_id.clone()), &(stored_nonce + 1));
+
+        // 6. Swap the key.
+        program_data.authorized_payout_key = new_key.clone();
+        Self::store_program_data(&env, &program_id, &program_data);
+
+        // 7. Emit auditable event.
+        env.events().publish(
+            (PAYOUT_KEY_ROTATED,),
+            PayoutKeyRotatedEvent {
+                version: EVENT_VERSION_V2,
+                program_id: program_id.clone(),
+                rotated_by: caller,
+                new_key,
+                nonce: stored_nonce + 1,
+                rotated_at: env.ledger().timestamp(),
+            },
+        );
+
+        program_data
+    }
+
+    /// Return the current rotation nonce for a program.
+    ///
+    /// Integrators should read this before constructing a `rotate_payout_key`
+    /// transaction to avoid nonce-mismatch panics.
+    pub fn get_rotation_nonce(env: Env, program_id: String) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::RotationNonce(program_id))
+            .unwrap_or(0u64)
+    }
+
     /// Computes reputation based on schedules, payouts, and funds.
     /// Returns zero overall_score_bps if any releases are overdue (penalty for missed milestones).
     pub fn get_program_reputation(env: Env) -> ProgramReputation {
@@ -4412,3 +4566,6 @@ mod test_metadata_tagging;
 #[cfg(test)]
 #[cfg(any())]
 mod rbac_tests;
+
+#[cfg(test)]
+mod test_rbac;

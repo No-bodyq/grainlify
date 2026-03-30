@@ -1656,3 +1656,133 @@ fn test_lock_program_funds_fee_recipient_different_from_admin() {
     assert_eq!(token_client.balance(&fee_recipient), 2_000);
     assert_eq!(token_client.balance(&admin), 0); // Admin receives nothing
 }
+
+// ---------------------------------------------------------------------------
+// Payout Key Rotation — lifecycle tests
+// ---------------------------------------------------------------------------
+
+/// Helper: set up a program and return (client, program_id, payout_key, admin).
+fn setup_rotation_program(
+    env: &Env,
+) -> (
+    ProgramEscrowContractClient<'static>,
+    String,
+    Address,
+    Address,
+) {
+    env.mock_all_auths();
+    let (client, contract_id) = make_client(env);
+    let (_token_client, token_id) = fund_contract(env, &contract_id, 50_000);
+    let admin = Address::generate(env);
+    let payout_key = Address::generate(env);
+    let program_id = String::from_str(env, "rot-prog");
+    client.initialize_contract(&admin);
+    client.init_program(&program_id, &payout_key, &token_id, &payout_key, &None, &None);
+    (client, program_id, payout_key, admin)
+}
+
+/// Happy path: current payout key rotates to a new key.
+#[test]
+fn test_rotation_by_current_payout_key_succeeds() {
+    let env = Env::default();
+    let (client, program_id, _old_key, _admin) = setup_rotation_program(&env);
+    let new_key = Address::generate(&env);
+
+    let nonce = client.get_rotation_nonce(&program_id);
+    assert_eq!(nonce, 0);
+
+    let data = client.rotate_payout_key(&program_id, &_old_key, &new_key, &nonce);
+    assert_eq!(data.authorized_payout_key, new_key);
+
+    // Nonce must have incremented.
+    assert_eq!(client.get_rotation_nonce(&program_id), 1);
+}
+
+/// Happy path: contract admin can rotate the payout key.
+#[test]
+fn test_rotation_by_admin_succeeds() {
+    let env = Env::default();
+    let (client, program_id, _payout_key, admin) = setup_rotation_program(&env);
+    let new_key = Address::generate(&env);
+
+    let nonce = client.get_rotation_nonce(&program_id);
+    let data = client.rotate_payout_key(&program_id, &admin, &new_key, &nonce);
+    assert_eq!(data.authorized_payout_key, new_key);
+    assert_eq!(client.get_rotation_nonce(&program_id), 1);
+}
+
+/// After rotation the new key can immediately perform a payout.
+#[test]
+fn test_new_key_can_payout_after_rotation() {
+    let env = Env::default();
+    env.mock_all_auths();
+    let (client, contract_id) = make_client(&env);
+    let (_token_client, token_id) = fund_contract(&env, &contract_id, 50_000);
+    let admin = Address::generate(&env);
+    let old_key = Address::generate(&env);
+    let new_key = Address::generate(&env);
+    let program_id = String::from_str(&env, "rot-prog");
+    client.initialize_contract(&admin);
+    client.init_program(&program_id, &old_key, &token_id, &old_key, &None, &None);
+    client.lock_program_funds(&50_000);
+
+    let nonce = client.get_rotation_nonce(&program_id);
+    client.rotate_payout_key(&program_id, &old_key, &new_key, &nonce);
+
+    // New key should be able to trigger a payout via the v2 entrypoint.
+    let recipient = Address::generate(&env);
+    let data = client.single_payout_v2(&program_id, &new_key, &recipient, &1_000);
+    assert_eq!(data.remaining_balance, 49_000);
+}
+
+/// Rotation increments nonce; a second rotation with the old nonce must fail.
+#[test]
+#[should_panic(expected = "Invalid nonce")]
+fn test_rotation_replay_rejected() {
+    let env = Env::default();
+    let (client, program_id, old_key, _admin) = setup_rotation_program(&env);
+    let new_key1 = Address::generate(&env);
+    let new_key2 = Address::generate(&env);
+
+    let nonce = client.get_rotation_nonce(&program_id); // 0
+    client.rotate_payout_key(&program_id, &old_key, &new_key1, &nonce);
+
+    // Attempt replay with stale nonce=0 — must panic.
+    client.rotate_payout_key(&program_id, &new_key1, &new_key2, &nonce);
+}
+
+/// Two sequential rotations on the same ledger are allowed (different nonces).
+#[test]
+fn test_rotate_twice_same_ledger_with_correct_nonces() {
+    let env = Env::default();
+    let (client, program_id, old_key, _admin) = setup_rotation_program(&env);
+    let key2 = Address::generate(&env);
+    let key3 = Address::generate(&env);
+
+    let nonce0 = client.get_rotation_nonce(&program_id);
+    client.rotate_payout_key(&program_id, &old_key, &key2, &nonce0);
+
+    let nonce1 = client.get_rotation_nonce(&program_id);
+    let data = client.rotate_payout_key(&program_id, &key2, &key3, &nonce1);
+    assert_eq!(data.authorized_payout_key, key3);
+    assert_eq!(client.get_rotation_nonce(&program_id), 2);
+}
+
+/// Rotating to the same address must be rejected.
+#[test]
+#[should_panic(expected = "New key must differ from current key")]
+fn test_rotate_to_self_rejected() {
+    let env = Env::default();
+    let (client, program_id, payout_key, _admin) = setup_rotation_program(&env);
+    let nonce = client.get_rotation_nonce(&program_id);
+    // Attempt to rotate to the same key.
+    client.rotate_payout_key(&program_id, &payout_key, &payout_key, &nonce);
+}
+
+/// get_rotation_nonce returns 0 for a fresh program.
+#[test]
+fn test_rotation_nonce_starts_at_zero() {
+    let env = Env::default();
+    let (client, program_id, _key, _admin) = setup_rotation_program(&env);
+    assert_eq!(client.get_rotation_nonce(&program_id), 0);
+}
