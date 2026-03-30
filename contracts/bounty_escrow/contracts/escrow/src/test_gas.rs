@@ -102,7 +102,7 @@ mod gas_profile {
             let depositor = Address::generate(&env);
             let contributor = Address::generate(&env);
 
-            let token_id = env.register_stellar_asset_contract(admin.clone());
+            let token_id = env.register_stellar_asset_contract_v2(admin.clone());
             let token_sac = token::StellarAssetClient::new(&env, &token_id);
 
             let contract_id = env.register_contract(None, BountyEscrowContract);
@@ -173,7 +173,7 @@ mod gas_profile {
         env.budget().reset_unlimited();
 
         let admin = Address::generate(&env);
-        let token_id = env.register_stellar_asset_contract(admin.clone());
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
         let cid = env.register_contract(None, BountyEscrowContract);
         let cli = BountyEscrowContractClient::new(&env, &cid);
 
@@ -818,7 +818,7 @@ mod gas_profile {
             env.mock_all_auths();
             env.budget().reset_unlimited();
             let admin = Address::generate(&env);
-            let token_id = env.register_stellar_asset_contract(admin.clone());
+            let token_id = env.register_stellar_asset_contract_v2(admin.clone());
             let cid = env.register_contract(None, BountyEscrowContract);
             let cli = BountyEscrowContractClient::new(&env, &cid);
             let d = measure(&env, || { cli.init(&admin, &token_id); });

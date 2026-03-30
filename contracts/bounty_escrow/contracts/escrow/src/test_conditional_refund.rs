@@ -27,7 +27,7 @@ mod test_conditional_refund {
         let depositor = Address::generate(&env);
         let oracle = Address::generate(&env);
 
-        let token_id = env.register_stellar_asset_contract(admin.clone());
+        let token_id = env.register_stellar_asset_contract_v2(admin.clone());
         let token_admin = token::StellarAssetClient::new(&env, &token_id);
 
         let contract_id = env.register_contract(None, BountyEscrowContract);
