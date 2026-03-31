@@ -5,7 +5,7 @@
 //! - Optimized storage access patterns
 //! - Reduced redundant computations
 
-use soroban_sdk::{vec, Env, String, Vec};
+use soroban_sdk::{vec, Address, Env, String, Symbol, Vec};
 
 /// Optimized batch lock processing with cached program data.
 pub fn optimized_batch_lock<F>(
@@ -79,7 +79,7 @@ pub fn deduplicate_program_ids(env: &Env, items: &Vec<String>) -> Vec<String> {
 
 /// Check for duplicates in a Vec<String> using O(n²) comparison.
 /// Returns true if duplicates exist.
-pub fn has_duplicates(env: &Env, items: &Vec<String>) -> bool {
+pub fn has_duplicates(_env: &Env, items: &Vec<String>) -> bool {
     let len = items.len();
     if len <= 1 {
         return false;
@@ -100,9 +100,9 @@ pub fn has_duplicates(env: &Env, items: &Vec<String>) -> bool {
 pub mod storage_efficiency {
     use soroban_sdk::{Env, Symbol};
 
-    /// Extend TTL for frequently accessed data.
-    pub fn extend_storage_ttl(env: &Env, _key: &Symbol, ttl_threshold: u32) {
-        env.storage().instance().extend_ttl(ttl_threshold, ttl_threshold);
+    /// Extend TTL for the contract instance.
+    pub fn extend_instance_ttl(env: &Env, ttl_threshold: u32, extend_to: u32) {
+        env.storage().instance().extend_ttl(ttl_threshold, extend_to);
     }
 
     /// Check if storage key exists without retrieving value.
@@ -180,10 +180,13 @@ pub mod efficient_math {
         numerator / basis_points
     }
 
-    /// Safe subtraction that returns 0 on underflow.
+    /// Safe subtraction that returns 0 when the result would be negative.
+    ///
+    /// Note: i128::checked_sub only returns None on arithmetic overflow (e.g.
+    /// i128::MIN - 1), not when the result is merely negative. This function
+    /// clamps the result to 0 for any case where b > a.
     pub fn safe_sub_zero(a: i128, b: i128) -> i128 {
-        let result = a.checked_sub(b).unwrap_or(0);
-        if result < 0 { 0 } else { result }
+        if b > a { 0 } else { a - b }
     }
 
     /// Clamp value between min and max.
@@ -200,8 +203,8 @@ pub mod efficient_math {
 
 /// Event emission helpers to reduce storage writes.
 pub mod event_helpers {
-    use soroban_sdk::{symbol_short, Env, Symbol};
-    
+    use soroban_sdk::{symbol_short, Address, Env, String, Symbol};
+
     /// Emit a lightweight event instead of storing state.
     pub fn emit_operation(env: &Env, operation: Symbol, data: u64) {
         env.events().publish(
