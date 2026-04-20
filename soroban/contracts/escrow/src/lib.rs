@@ -4,7 +4,7 @@
 
 use soroban_sdk::{
     contract, contracterror, contractimpl, contracttype, symbol_short, token, Address, BytesN, Env,
-    String, Symbol, Vec,
+    IntoVal, String, Symbol, Val, Vec,
 };
 
 const ESCROW_DELEGATE_SET: soroban_sdk::Symbol = symbol_short!("EscDlgS");
@@ -44,6 +44,8 @@ pub enum Error {
     InvalidLabel = 226,
     TooManyLabels = 227,
     LabelNotAllowed = 228,
+    InvalidDelegatePermissions = 229,
+    InvalidDelegateTarget = 230,
     // Identity-related errors
     InvalidSignature = 301,
     ClaimExpired = 302,
@@ -78,12 +80,6 @@ pub struct Escrow {
     pub delegate_permissions: u32,
     pub metadata: Option<String>,
 }
-
-const MAX_PAGE_SIZE: u32 = 20;
-const MAX_LABELS: u32 = 10;
-const MAX_LABEL_LENGTH: u32 = 32;
-const ESCROW_LABELS_UPDATED: Symbol = symbol_short!("esc_lbl");
-const LABEL_CONFIG_UPDATED: Symbol = symbol_short!("lbl_cfg");
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -175,53 +171,6 @@ pub struct EscrowMetadataUpdatedEvent {
     pub bounty_id: u64,
     pub updated_by: Address,
     pub timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LabelConfig {
-    pub restricted: bool,
-    pub allowed_labels: Vec<String>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct LabelConfigUpdatedEvent {
-    pub version: u32,
-    pub admin: Address,
-    pub restricted: bool,
-    pub allowed_labels: Vec<String>,
-    pub timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowLabelsUpdatedEvent {
-    pub version: u32,
-    pub bounty_id: u64,
-    pub actor: Address,
-    pub labels: Vec<String>,
-    pub timestamp: u64,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowLabelRecord {
-    pub bounty_id: u64,
-    pub depositor: Address,
-    pub amount: i128,
-    pub remaining_amount: i128,
-    pub status: EscrowStatus,
-    pub deadline: u64,
-    pub labels: Vec<String>,
-}
-
-#[contracttype]
-#[derive(Clone, Debug, Eq, PartialEq)]
-pub struct EscrowLabelPage {
-    pub records: Vec<EscrowLabelRecord>,
-    pub next_cursor: Option<u64>,
-    pub has_more: bool,
 }
 
 #[contracttype]
@@ -757,12 +706,12 @@ impl EscrowContract {
                 .set(&DataKey::EscrowJurisdiction(bounty_id), config);
 
             // Emit juris event for lock
+            let mut topics: Vec<Val> = Vec::new(&env);
+            topics.push_back(Symbol::new(&env, "juris").into_val(&env));
+            topics.push_back(Symbol::new(&env, "lock").into_val(&env));
+            topics.push_back(bounty_id.into_val(&env));
             env.events().publish(
-                (
-                    soroban_sdk::symbol_short!("juris"),
-                    soroban_sdk::symbol_short!("lock"),
-                    bounty_id,
-                ),
+                topics,
                 (
                     config.tag.clone(),
                     config.requires_kyc,

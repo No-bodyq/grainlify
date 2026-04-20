@@ -988,6 +988,7 @@ impl ProgramEscrowContract {
             );
             let program = Program {
                 admin: item.admin.clone(),
+                payout_key: item.admin.clone(),
                 name: item.name.clone(),
                 total_funding: item.total_funding,
                 status: ProgramStatus::Active,
@@ -1507,8 +1508,6 @@ impl ProgramEscrowContract {
 }
 
 #[cfg(test)]
-mod test_utils;
-#[cfg(test)]
 mod test;
 #[cfg(test)]
 mod test_ownership_transfer;
@@ -1518,7 +1517,5 @@ mod test_search;
 mod test_full_lifecycle;
 #[cfg(test)]
 mod test_max_counts;
-#[cfg(test)]
-mod test_search;
 #[cfg(test)]
 mod test_error_discrimination;
