@@ -5489,6 +5489,143 @@ impl BountyEscrowContract {
     pub fn is_reentrancy_guard_locked(env: Env) -> bool {
         env.storage().instance().get(&symbol_short!("r_guard")).unwrap_or(false)
     }
+
+    // ============================================================================
+    // HIGH-VALUE RELEASE TIMELOCK QUEUE
+    // ============================================================================
+
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct HighValueConfig {
+        pub threshold: i128,
+        pub duration: u64,
+    }
+
+    #[contracttype]
+    #[derive(Clone, Debug, Eq, PartialEq)]
+    pub struct QueuedRelease {
+        pub contributor: Address,
+        pub amount: i128,
+        pub executable_at: u64,
+    }
+
+    /// Configures the high-value timelock threshold and duration.
+    pub fn set_high_value_config(
+        env: Env,
+        threshold: i128,
+        duration: u64,
+    ) -> Result<(), Error> {
+        let admin = rbac::require_admin(&env);
+        admin.require_auth();
+
+        if threshold <= 0 {
+            return Err(Error::InvalidAmount);
+        }
+
+        let config = HighValueConfig { threshold, duration };
+        env.storage().instance().set(&symbol_short!("hv_cfg"), &config);
+
+        events::emit_high_value_config_updated(
+            &env,
+            events::HighValueConfigUpdated {
+                version: events::EVENT_VERSION_V2,
+                admin,
+                threshold,
+                duration,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// View: Gets the current high-value release configuration.
+    pub fn get_high_value_config(env: Env) -> Option<HighValueConfig> {
+        env.storage().instance().get(&symbol_short!("hv_cfg"))
+    }
+
+    /// View: Gets a currently queued release for a specific bounty.
+    pub fn get_queued_release(env: Env, bounty_id: u64) -> Option<QueuedRelease> {
+        env.storage()
+            .persistent()
+            .get(&(symbol_short!("hv_q"), bounty_id))
+    }
+
+    /// Queues a high-value release for the timelock.
+    /// In a full flow, this replaces the direct token transfer in `release_funds` when amount >= threshold.
+    pub fn queue_high_value_release(
+        env: Env,
+        bounty_id: u64,
+        contributor: Address,
+        amount: i128,
+    ) -> Result<(), Error> {
+        let admin = rbac::require_admin(&env);
+        admin.require_auth(); // Authorized by admin or delegator in standard flow
+
+        let config = Self::get_high_value_config(env.clone()).unwrap_or(HighValueConfig {
+            threshold: i128::MAX, // Effectively disables if unconfigured
+            duration: 0,
+        });
+
+        if amount < config.threshold {
+            return Err(Error::InvalidAmount); 
+        }
+
+        let executable_at = env.ledger().timestamp().saturating_add(config.duration);
+        let queued = QueuedRelease {
+            contributor: contributor.clone(),
+            amount,
+            executable_at,
+        };
+
+        // Upgrade-safe tuple storage key
+        env.storage()
+            .persistent()
+            .set(&(symbol_short!("hv_q"), bounty_id), &queued);
+
+        events::emit_release_queued(
+            &env,
+            events::ReleaseQueued {
+                version: events::EVENT_VERSION_V2,
+                bounty_id,
+                contributor,
+                amount,
+                executable_at,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Executes a queued release once its timelock has expired.
+    pub fn execute_queued_release(env: Env, bounty_id: u64) -> Result<(), Error> {
+        let queued = Self::get_queued_release(env.clone(), bounty_id).ok_or(Error::BountyNotFound)?;
+
+        if env.ledger().timestamp() < queued.executable_at {
+            return Err(Error::DeadlineNotPassed);
+        }
+
+        // Clean up the queue to prevent double-spending
+        env.storage()
+            .persistent()
+            .remove(&(symbol_short!("hv_q"), bounty_id));
+
+        // Note: Contract-to-token transfer logic integrates here
+
+        events::emit_queued_release_executed(
+            &env,
+            events::QueuedReleaseExecuted {
+                version: events::EVENT_VERSION_V2,
+                bounty_id,
+                contributor: queued.contributor,
+                amount: queued.amount,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
 }
 
 

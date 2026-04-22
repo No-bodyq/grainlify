@@ -301,6 +301,30 @@
         "authorization": "admin",
         "pausable": true,
         "gas_estimate": "high"
+      },
+      {
+        "name": "queue_high_value_release",
+        "description": "Queue a high-value release into the timelock",
+        "parameters": [
+          { "name": "bounty_id", "type": "u64", "description": "Bounty identifier" },
+          { "name": "contributor", "type": "Address", "description": "Receiving address" },
+          { "name": "amount", "type": "i128", "description": "Amount to release" }
+        ],
+        "returns": { "type": "()", "description": "Empty on success" },
+        "authorization": "admin",
+        "pausable": true,
+        "gas_estimate": "medium"
+      },
+      {
+        "name": "execute_queued_release",
+        "description": "Execute a release after its timelock expires",
+        "parameters": [
+          { "name": "bounty_id", "type": "u64", "description": "Bounty identifier" }
+        ],
+        "returns": { "type": "()", "description": "Empty on success" },
+        "authorization": "any",
+        "pausable": true,
+        "gas_estimate": "medium"
       }
     ],
     "view": [
@@ -522,6 +546,24 @@
         "authorization": "any",
         "pausable": false,
         "gas_estimate": "low"
+      },
+      {
+        "name": "get_high_value_config",
+        "description": "View global high-value release config",
+        "parameters": [],
+        "returns": { "type": "Option<HighValueConfig>" },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "get_queued_release",
+        "description": "View queued release details for a bounty",
+        "parameters": [{ "name": "bounty_id", "type": "u64" }],
+        "returns": { "type": "Option<QueuedRelease>" },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
       }
     ],
     "admin": [
@@ -721,6 +763,18 @@
           { "name": "bounty_id", "type": "u64", "description": "Bounty identifier" },
           { "name": "start_time", "type": "u64", "description": "Timestamp when claiming begins" },
           { "name": "end_time", "type": "u64", "description": "Timestamp when claiming expires" }
+        ],
+        "returns": { "type": "()", "description": "Empty on success" },
+        "authorization": "admin",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "set_high_value_config",
+        "description": "Configure the threshold and delay for high-value releases",
+        "parameters": [
+          { "name": "threshold", "type": "i128", "description": "Amount triggering the timelock" },
+          { "name": "duration", "type": "u64", "description": "Timelock duration in seconds" }
         ],
         "returns": { "type": "()", "description": "Empty on success" },
         "authorization": "admin",

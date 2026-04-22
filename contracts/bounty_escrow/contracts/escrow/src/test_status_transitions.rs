@@ -564,3 +564,58 @@ fn test_reentrancy_guard_lifecycle_and_view() {
     setup.env.storage().instance().remove(&symbol_short!("r_guard"));
     assert_eq!(setup.escrow.is_reentrancy_guard_locked(), false);
 }
+
+// ============================================================================
+// HIGH-VALUE TIMELOCK TESTS
+// ============================================================================
+
+#[test]
+fn test_high_value_queue_and_execute() {
+    let setup = TestSetup::new();
+    let bounty_id = 1;
+    let threshold = 5000;
+    let duration = 86400; // 24 hours
+    let current_time = setup.env.ledger().timestamp();
+
+    // Configure
+    setup.escrow.set_high_value_config(&threshold, &duration);
+    
+    // Queue a release
+    setup.escrow.queue_high_value_release(&bounty_id, &setup.contributor, &6000);
+    
+    let queued = setup.escrow.get_queued_release(&bounty_id).unwrap();
+    assert_eq!(queued.amount, 6000);
+    assert_eq!(queued.executable_at, current_time + duration);
+
+    // Fast-forward past the timelock
+    setup.env.ledger().set_timestamp(current_time + duration + 1);
+    
+    // Execute
+    assert_eq!(setup.escrow.execute_queued_release(&bounty_id), ());
+    assert!(setup.escrow.get_queued_release(&bounty_id).is_none());
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #6)")] // DeadlineNotPassed
+fn test_execute_queued_release_fails_early() {
+    let setup = TestSetup::new();
+    let bounty_id = 1;
+    
+    setup.escrow.set_high_value_config(&5000, &86400);
+    setup.escrow.queue_high_value_release(&bounty_id, &setup.contributor, &6000);
+    
+    // Attempting execution immediately should panic
+    setup.escrow.execute_queued_release(&bounty_id);
+}
+
+#[test]
+#[should_panic(expected = "Error(Contract, #13)")] // InvalidAmount
+fn test_queue_fails_below_threshold() {
+    let setup = TestSetup::new();
+    let bounty_id = 1;
+    
+    setup.escrow.set_high_value_config(&5000, &86400);
+    
+    // Queueing 4000 when threshold is 5000 should panic
+    setup.escrow.queue_high_value_release(&bounty_id, &setup.contributor, &4000);
+}

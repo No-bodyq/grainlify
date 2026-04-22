@@ -1446,3 +1446,53 @@ pub fn emit_reentrancy_attempt_blocked(env: &Env, event: ReentrancyAttemptBlocke
     let topics = (symbol_short!("r_guard"),);
     env.events().publish(topics, event);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// HIGH-VALUE TIMELOCK EVENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct HighValueConfigUpdated {
+    pub version: u32,
+    pub admin: Address,
+    pub threshold: i128,
+    pub duration: u64,
+    pub timestamp: u64,
+}
+
+pub fn emit_high_value_config_updated(env: &Env, event: HighValueConfigUpdated) {
+    let topics = (symbol_short!("hv_cfg"),);
+    env.events().publish(topics, event);
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReleaseQueued {
+    pub version: u32,
+    pub bounty_id: u64,
+    pub contributor: Address,
+    pub amount: i128,
+    pub executable_at: u64,
+    pub timestamp: u64,
+}
+
+pub fn emit_release_queued(env: &Env, event: ReleaseQueued) {
+    let topics = (symbol_short!("hv_q"), event.bounty_id);
+    env.events().publish(topics, event);
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct QueuedReleaseExecuted {
+    pub version: u32,
+    pub bounty_id: u64,
+    pub contributor: Address,
+    pub amount: i128,
+    pub timestamp: u64,
+}
+
+pub fn emit_queued_release_executed(env: &Env, event: QueuedReleaseExecuted) {
+    let topics = (symbol_short!("hv_exec"), event.bounty_id);
+    env.events().publish(topics, event);
+}
