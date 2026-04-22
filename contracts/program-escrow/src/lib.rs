@@ -686,6 +686,10 @@ pub struct ProgramInitItem {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct MultisigConfig {
+    /// Maximum gross spend allowed in one payout operation.
+    /// - `single_payout`: compared against the requested `amount`
+    /// - `batch_payout`: compared against the computed batch `total_payout`
+    /// `i128::MAX` disables spend-threshold enforcement.
     pub threshold_amount: i128,
     pub signers: soroban_sdk::Vec<Address>,
     pub required_signatures: u32,
@@ -2195,6 +2199,62 @@ impl ProgramEscrowContract {
             })
     }
 
+    /// Set the per-program spend threshold.
+    ///
+    /// Security and deterministic behavior:
+    /// - Admin only.
+    /// - `threshold_amount` must be strictly positive.
+    /// - Payout validation checks this threshold before balance checks.
+    pub fn set_program_spend_threshold(env: Env, program_id: String, threshold_amount: i128) {
+        let _ = Self::require_admin(&env);
+        if threshold_amount <= 0 {
+            panic!("Invalid spend threshold");
+        }
+
+        let mut cfg: MultisigConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigConfig(program_id.clone()))
+            .unwrap_or(MultisigConfig {
+                threshold_amount: i128::MAX,
+                signers: vec![&env],
+                required_signatures: 0,
+            });
+        cfg.threshold_amount = threshold_amount;
+        env.storage()
+            .persistent()
+            .set(&DataKey::MultisigConfig(program_id), &cfg);
+    }
+
+    /// Read per-program spend threshold. Returns `i128::MAX` when unset.
+    pub fn get_program_spend_threshold(env: Env, program_id: String) -> i128 {
+        let cfg: MultisigConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigConfig(program_id))
+            .unwrap_or(MultisigConfig {
+                threshold_amount: i128::MAX,
+                signers: vec![&env],
+                required_signatures: 0,
+            });
+        cfg.threshold_amount
+    }
+
+    fn enforce_spend_threshold(env: &Env, program_id: &String, requested_amount: i128) {
+        let cfg: MultisigConfig = env
+            .storage()
+            .persistent()
+            .get(&DataKey::MultisigConfig(program_id.clone()))
+            .unwrap_or(MultisigConfig {
+                threshold_amount: i128::MAX,
+                signers: vec![env],
+                required_signatures: 0,
+            });
+        if requested_amount > cfg.threshold_amount {
+            panic!("Spend threshold exceeded");
+        }
+    }
+
     pub fn get_analytics(_env: Env) -> Analytics {
         Analytics {
             total_locked: 0,
@@ -2316,6 +2376,10 @@ impl ProgramEscrowContract {
         }
 
         // 6. Business logic: sufficient balance
+        // Deterministic error ordering: spend threshold check runs before
+        // balance/circuit checks, so clients observe stable failures.
+        Self::enforce_spend_threshold(&env, &program_data.program_id, total_payout);
+
         if total_payout > program_data.remaining_balance {
             reentrancy_guard::clear_entered(&env);
             panic!("Insufficient balance");
@@ -2482,6 +2546,10 @@ impl ProgramEscrowContract {
         }
 
         // 6. Business logic: sufficient balance
+        // Deterministic error ordering: spend threshold check runs before
+        // balance/circuit checks, so clients observe stable failures.
+        Self::enforce_spend_threshold(&env, &program_data.program_id, amount);
+
         if amount > program_data.remaining_balance {
             reentrancy_guard::clear_entered(&env);
             panic!("Insufficient balance");

@@ -1939,6 +1939,57 @@ fn test_batch_payout_atomicity_all_or_nothing() {
 }
 
 #[test]
+fn test_spend_threshold_single_payout_at_boundary_allowed() {
+    let env = Env::default();
+    let (client, _admin, token_client, _token_admin) = setup_program(&env, 50_000);
+    let program_id = String::from_str(&env, "hack-2026");
+
+    client.set_program_spend_threshold(&program_id, &10_000);
+
+    let recipient = Address::generate(&env);
+    let data = client.single_payout(&recipient, &10_000);
+
+    assert_eq!(data.remaining_balance, 40_000);
+    assert_eq!(token_client.balance(&recipient), 10_000);
+}
+
+#[test]
+#[should_panic(expected = "Spend threshold exceeded")]
+fn test_spend_threshold_single_payout_above_limit_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token_client, _token_admin) = setup_program(&env, 50_000);
+    let program_id = String::from_str(&env, "hack-2026");
+
+    client.set_program_spend_threshold(&program_id, &10_000);
+
+    let recipient = Address::generate(&env);
+    client.single_payout(&recipient, &10_001);
+}
+
+#[test]
+#[should_panic(expected = "Spend threshold exceeded")]
+fn test_spend_threshold_batch_total_above_limit_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token_client, _token_admin) = setup_program(&env, 50_000);
+    let program_id = String::from_str(&env, "hack-2026");
+
+    client.set_program_spend_threshold(&program_id, &10_000);
+
+    let recipients = vec![&env, Address::generate(&env), Address::generate(&env)];
+    let amounts = vec![&env, 6_000, 5_000];
+    client.batch_payout(&recipients, &amounts);
+}
+
+#[test]
+#[should_panic(expected = "Invalid spend threshold")]
+fn test_spend_threshold_must_be_positive() {
+    let env = Env::default();
+    let (client, _admin, _token_client, _token_admin) = setup_program(&env, 1_000);
+    let program_id = String::from_str(&env, "hack-2026");
+    client.set_program_spend_threshold(&program_id, &0);
+}
+
+#[test]
 fn test_batch_payout_sequential_batches() {
     // Test multiple sequential batch payouts to same program
     // Validates that history accumulates correctly
