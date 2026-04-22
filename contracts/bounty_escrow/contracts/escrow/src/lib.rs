@@ -34,11 +34,13 @@ use crate::events::{
     emit_funds_locked_anon, emit_funds_refunded, emit_funds_released,
     emit_maintenance_mode_changed, emit_notification_preferences_updated,
     emit_participant_filter_mode_changed, emit_risk_flags_updated, emit_ticket_claimed,
-    emit_ticket_issued, BatchFundsLocked, BatchFundsReleased, BountyEscrowInitialized,
-    ClaimCancelled, ClaimCreated, ClaimExecuted, CriticalOperationOutcome, DeprecationStateChanged,
-    DeterministicSelectionDerived, FundsLocked, FundsLockedAnon, FundsRefunded, FundsReleased,
-    MaintenanceModeChanged, NotificationPreferencesUpdated, ParticipantFilterModeChanged,
-    RefundTriggerType, RiskFlagsUpdated, TicketClaimed, TicketIssued, EVENT_VERSION_V2,
+    emit_refund_approval_consumed, emit_refund_approval_set, emit_ticket_issued, BatchFundsLocked,
+    BatchFundsReleased, BountyEscrowInitialized, ClaimCancelled, ClaimCreated, ClaimExecuted,
+    CriticalOperationOutcome, DeprecationStateChanged, DeterministicSelectionDerived, FundsLocked,
+    FundsLockedAnon, FundsRefunded, FundsReleased, MaintenanceModeChanged,
+    NotificationPreferencesUpdated, ParticipantFilterModeChanged, RefundApprovalConsumed,
+    RefundApprovalSet, RefundTriggerType, RiskFlagsUpdated, TicketClaimed, TicketIssued,
+    EVENT_VERSION_V2,
 };
 use soroban_sdk::xdr::ToXdr;
 use soroban_sdk::{
@@ -735,6 +737,35 @@ pub struct EscrowInfo {
     pub refund_history: Vec<RefundRecord>,
 }
 
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum RefundEligibilityCode {
+    EligibleDeadlinePassed,
+    EligibleAdminApproval,
+    IneligibleBountyNotFound,
+    IneligibleAnonymousRequiresResolution,
+    IneligibleRefundPaused,
+    IneligibleEscrowFrozen,
+    IneligibleAddressFrozen,
+    IneligibleInvalidStatus,
+    IneligibleClaimPending,
+    IneligibleDeadlineNotPassed,
+    IneligibleInvalidApproval,
+}
+
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundEligibilityView {
+    pub eligible: bool,
+    pub code: RefundEligibilityCode,
+    pub bounty_id: u64,
+    pub amount: i128,
+    pub recipient: Option<Address>,
+    pub now: u64,
+    pub deadline: u64,
+    pub approval_present: bool,
+}
+
 /// Immutable audit record for an escrow-level or address-level freeze.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -799,6 +830,8 @@ pub enum DataKey {
     RenewalHistory(u64),
     /// Per-bounty rollover chain link metadata.
     CycleLink(u64),
+    /// Stored schema marker for refund-eligibility view semantics.
+    RefundEligibilitySchemaVersion,
 }
 
 #[contracttype]
@@ -925,6 +958,8 @@ pub struct ReleaseApproval {
     pub contributor: Address,
     pub approvals: Vec<Address>,
 }
+
+const REFUND_ELIGIBILITY_SCHEMA_VERSION_V1: u32 = 1;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1145,6 +1180,10 @@ impl BountyEscrowContract {
         env.storage().instance().set(&DataKey::Token, &token);
         // Version 2 reflects the breaking shared-trait interface alignment.
         env.storage().instance().set(&DataKey::Version, &2u32);
+        env.storage().instance().set(
+            &DataKey::RefundEligibilitySchemaVersion,
+            &REFUND_ELIGIBILITY_SCHEMA_VERSION_V1,
+        );
 
         events::emit_bounty_initialized(
             &env,
@@ -3779,6 +3818,199 @@ impl BountyEscrowContract {
             .ok_or(Error::BountyNotFound)
     }
 
+    fn compute_refund_eligibility(env: &Env, bounty_id: u64) -> RefundEligibilityView {
+        let now = env.ledger().timestamp();
+
+        if Self::check_paused(env, symbol_short!("refund")) {
+            return RefundEligibilityView {
+                eligible: false,
+                code: RefundEligibilityCode::IneligibleRefundPaused,
+                bounty_id,
+                amount: 0,
+                recipient: None,
+                now,
+                deadline: 0,
+                approval_present: false,
+            };
+        }
+
+        if env.storage().persistent().has(&DataKey::EscrowAnon(bounty_id)) {
+            let anon: AnonymousEscrow = env
+                .storage()
+                .persistent()
+                .get(&DataKey::EscrowAnon(bounty_id))
+                .unwrap();
+            return RefundEligibilityView {
+                eligible: false,
+                code: RefundEligibilityCode::IneligibleAnonymousRequiresResolution,
+                bounty_id,
+                amount: 0,
+                recipient: None,
+                now,
+                deadline: anon.deadline,
+                approval_present: false,
+            };
+        }
+
+        if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
+            return RefundEligibilityView {
+                eligible: false,
+                code: RefundEligibilityCode::IneligibleBountyNotFound,
+                bounty_id,
+                amount: 0,
+                recipient: None,
+                now,
+                deadline: 0,
+                approval_present: false,
+            };
+        }
+
+        let escrow: Escrow = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Escrow(bounty_id))
+            .unwrap();
+
+        if Self::ensure_escrow_not_frozen(env, bounty_id).is_err() {
+            return RefundEligibilityView {
+                eligible: false,
+                code: RefundEligibilityCode::IneligibleEscrowFrozen,
+                bounty_id,
+                amount: 0,
+                recipient: None,
+                now,
+                deadline: escrow.deadline,
+                approval_present: false,
+            };
+        }
+        if Self::ensure_address_not_frozen(env, &escrow.depositor).is_err() {
+            return RefundEligibilityView {
+                eligible: false,
+                code: RefundEligibilityCode::IneligibleAddressFrozen,
+                bounty_id,
+                amount: 0,
+                recipient: None,
+                now,
+                deadline: escrow.deadline,
+                approval_present: false,
+            };
+        }
+        if escrow.status != EscrowStatus::Locked && escrow.status != EscrowStatus::PartiallyRefunded {
+            return RefundEligibilityView {
+                eligible: false,
+                code: RefundEligibilityCode::IneligibleInvalidStatus,
+                bounty_id,
+                amount: 0,
+                recipient: None,
+                now,
+                deadline: escrow.deadline,
+                approval_present: false,
+            };
+        }
+
+        if env
+            .storage()
+            .persistent()
+            .has(&DataKey::PendingClaim(bounty_id))
+        {
+            let claim: ClaimRecord = env
+                .storage()
+                .persistent()
+                .get(&DataKey::PendingClaim(bounty_id))
+                .unwrap();
+            if !claim.claimed {
+                return RefundEligibilityView {
+                    eligible: false,
+                    code: RefundEligibilityCode::IneligibleClaimPending,
+                    bounty_id,
+                    amount: 0,
+                    recipient: None,
+                    now,
+                    deadline: escrow.deadline,
+                    approval_present: false,
+                };
+            }
+        }
+
+        let approval: Option<RefundApproval> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RefundApproval(bounty_id));
+        if let Some(app) = approval {
+            if app.amount <= 0 || app.amount > escrow.remaining_amount {
+                return RefundEligibilityView {
+                    eligible: false,
+                    code: RefundEligibilityCode::IneligibleInvalidApproval,
+                    bounty_id,
+                    amount: 0,
+                    recipient: None,
+                    now,
+                    deadline: escrow.deadline,
+                    approval_present: true,
+                };
+            }
+            return RefundEligibilityView {
+                eligible: true,
+                code: RefundEligibilityCode::EligibleAdminApproval,
+                bounty_id,
+                amount: app.amount,
+                recipient: Some(app.recipient),
+                now,
+                deadline: escrow.deadline,
+                approval_present: true,
+            };
+        }
+
+        if now >= escrow.deadline {
+            return RefundEligibilityView {
+                eligible: true,
+                code: RefundEligibilityCode::EligibleDeadlinePassed,
+                bounty_id,
+                amount: escrow.remaining_amount,
+                recipient: Some(escrow.depositor),
+                now,
+                deadline: escrow.deadline,
+                approval_present: false,
+            };
+        }
+
+        RefundEligibilityView {
+            eligible: false,
+            code: RefundEligibilityCode::IneligibleDeadlineNotPassed,
+            bounty_id,
+            amount: 0,
+            recipient: None,
+            now,
+            deadline: escrow.deadline,
+            approval_present: false,
+        }
+    }
+
+    /// Backward-compatible refund-eligibility tuple view.
+    /// Returns `(can_refund, deadline_passed, remaining_amount, approval)`.
+    pub fn get_refund_eligibility(
+        env: Env,
+        bounty_id: u64,
+    ) -> (bool, bool, i128, Option<RefundApproval>) {
+        let view = Self::compute_refund_eligibility(&env, bounty_id);
+        let approval: Option<RefundApproval> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::RefundApproval(bounty_id));
+        let deadline_passed = view.deadline > 0 && view.now >= view.deadline;
+        (
+            view.eligible,
+            deadline_passed,
+            view.amount,
+            if view.approval_present { approval } else { None },
+        )
+    }
+
+    /// New typed refund-eligibility view with explicit semantics.
+    pub fn get_refund_eligibility_view(env: Env, bounty_id: u64) -> RefundEligibilityView {
+        Self::compute_refund_eligibility(&env, bounty_id)
+    }
+
     /// Approve a refund before deadline (admin only).
     /// This allows early refunds with admin approval.
     pub fn approve_refund(
@@ -3826,6 +4058,19 @@ impl BountyEscrowContract {
         env.storage()
             .persistent()
             .set(&DataKey::RefundApproval(bounty_id), &approval);
+
+        emit_refund_approval_set(
+            &env,
+            RefundApprovalSet {
+                version: EVENT_VERSION_V2,
+                bounty_id,
+                amount,
+                recipient,
+                mode,
+                approved_by: admin,
+                approved_at: env.ledger().timestamp(),
+            },
+        );
 
         Ok(())
     }
@@ -4077,6 +4322,16 @@ impl BountyEscrowContract {
         // Remove approval after successful execution
         if approval.is_some() {
             env.storage().persistent().remove(&approval_key);
+            emit_refund_approval_consumed(
+                &env,
+                RefundApprovalConsumed {
+                    version: EVENT_VERSION_V2,
+                    bounty_id,
+                    refunded_amount: refund_amount,
+                    refunded_to: refund_to.clone(),
+                    consumed_at: now,
+                },
+            );
         }
 
         // INTERACTION: external token transfer is last
@@ -4165,9 +4420,6 @@ impl BountyEscrowContract {
     }
 
     fn dry_run_refund_impl(env: &Env, bounty_id: u64) -> Result<(i128, EscrowStatus, i128), Error> {
-        if Self::check_paused(env, symbol_short!("refund")) {
-            return Err(Error::FundsPaused);
-        }
         if !env.storage().persistent().has(&DataKey::Escrow(bounty_id)) {
             return Err(Error::BountyNotFound);
         }
@@ -4176,46 +4428,30 @@ impl BountyEscrowContract {
             .persistent()
             .get(&DataKey::Escrow(bounty_id))
             .unwrap();
-        Self::ensure_escrow_not_frozen(env, bounty_id)?;
-        Self::ensure_address_not_frozen(env, &escrow.depositor)?;
-        if escrow.status != EscrowStatus::Locked && escrow.status != EscrowStatus::PartiallyRefunded
-        {
-            return Err(Error::FundsNotLocked);
+        let eligibility = Self::compute_refund_eligibility(env, bounty_id);
+        if !eligibility.eligible {
+            return Err(match eligibility.code {
+                RefundEligibilityCode::IneligibleRefundPaused => Error::FundsPaused,
+                RefundEligibilityCode::IneligibleBountyNotFound => Error::BountyNotFound,
+                RefundEligibilityCode::IneligibleAnonymousRequiresResolution => {
+                    Error::AnonymousRefundRequiresResolution
+                }
+                RefundEligibilityCode::IneligibleEscrowFrozen => Error::EscrowFrozen,
+                RefundEligibilityCode::IneligibleAddressFrozen => Error::AddressFrozen,
+                RefundEligibilityCode::IneligibleInvalidStatus => Error::FundsNotLocked,
+                RefundEligibilityCode::IneligibleClaimPending => Error::ClaimPending,
+                RefundEligibilityCode::IneligibleDeadlineNotPassed => Error::DeadlineNotPassed,
+                RefundEligibilityCode::IneligibleInvalidApproval => Error::InvalidAmount,
+                RefundEligibilityCode::EligibleDeadlinePassed
+                | RefundEligibilityCode::EligibleAdminApproval => Error::InvalidAmount,
+            });
         }
-        if env
-            .storage()
-            .persistent()
-            .has(&DataKey::PendingClaim(bounty_id))
-        {
-            let claim: ClaimRecord = env
-                .storage()
-                .persistent()
-                .get(&DataKey::PendingClaim(bounty_id))
-                .unwrap();
-            if !claim.claimed {
-                return Err(Error::ClaimPending);
-            }
-        }
-        let now = env.ledger().timestamp();
-        let approval_key = DataKey::RefundApproval(bounty_id);
-        let approval: Option<RefundApproval> = env.storage().persistent().get(&approval_key);
-        if now < escrow.deadline && approval.is_none() {
-            return Err(Error::DeadlineNotPassed);
-        }
-        let (refund_amount, _refund_to, is_full) = if let Some(app) = approval {
-            let full = app.mode == RefundMode::Full || app.amount >= escrow.remaining_amount;
-            (app.amount, app.recipient, full)
-        } else {
-            (escrow.remaining_amount, escrow.depositor.clone(), true)
-        };
-        if refund_amount <= 0 || refund_amount > escrow.remaining_amount {
-            return Err(Error::InvalidAmount);
-        }
+        let refund_amount = eligibility.amount;
         let remaining_after = escrow
             .remaining_amount
             .checked_sub(refund_amount)
             .unwrap_or(0);
-        let resulting_status = if is_full || remaining_after == 0 {
+        let resulting_status = if remaining_after == 0 {
             EscrowStatus::Refunded
         } else {
             EscrowStatus::PartiallyRefunded

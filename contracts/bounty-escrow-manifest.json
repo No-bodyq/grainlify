@@ -26,6 +26,15 @@
           "Enhanced monitoring and analytics",
           "Added claim period functionality"
         ]
+      },
+      {
+        "version": "2.1.0",
+        "release_date": "2026-04-22",
+        "changes": [
+          "Added explicit refund eligibility view with deterministic semantics",
+          "Added refund approval audit events for approval set/consumption lifecycle",
+          "Added upgrade-safe storage marker for refund eligibility schema versioning"
+        ]
       }
     ]
   },
@@ -442,6 +451,24 @@
         "gas_estimate": "medium"
       },
       {
+        "name": "get_refund_eligibility_view",
+        "description": "Return deterministic typed refund eligibility status, amount, and recipient preview",
+        "parameters": [
+          {
+            "name": "bounty_id",
+            "type": "u64",
+            "description": "Bounty identifier"
+          }
+        ],
+        "returns": {
+          "type": "RefundEligibilityView",
+          "description": "Eligibility state with explicit semantic code and preview fields"
+        },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
         "name": "health_check",
         "description": "Get contract health status",
         "parameters": [],
@@ -758,6 +785,12 @@
         "data_structure": "Capability"
       },
       {
+        "name": "RefundEligibilitySchemaVersion",
+        "type": "instance",
+        "description": "Version marker for refund eligibility view semantics",
+        "data_structure": "u32"
+      },
+      {
         "name": "ReentrancyGuard",
         "type": "temporary",
         "description": "Reentrancy protection flag",
@@ -775,7 +808,8 @@
       "Anti-abuse mechanisms with whitelisting",
       "Input validation for all parameters",
       "Overflow protection in arithmetic operations",
-      "Event emission for audit trail"
+      "Event emission for audit trail",
+      "Deterministic refund eligibility view semantics"
     ],
     "access_control": [
       {
@@ -993,6 +1027,45 @@
           }
         ],
         "trigger": "Successful refund_funds call"
+      },
+      {
+        "name": "RefundApprovalSet",
+        "description": "Admin refund approval created or updated",
+        "data": [
+          {
+            "name": "bounty_id",
+            "type": "u64",
+            "description": "Bounty identifier"
+          },
+          {
+            "name": "amount",
+            "type": "i128",
+            "description": "Approved refund amount"
+          },
+          {
+            "name": "recipient",
+            "type": "Address",
+            "description": "Approved refund recipient"
+          }
+        ],
+        "trigger": "Successful approve_refund call"
+      },
+      {
+        "name": "RefundApprovalConsumed",
+        "description": "Stored refund approval consumed by refund execution",
+        "data": [
+          {
+            "name": "bounty_id",
+            "type": "u64",
+            "description": "Bounty identifier"
+          },
+          {
+            "name": "refunded_amount",
+            "type": "i128",
+            "description": "Amount refunded using stored approval"
+          }
+        ],
+        "trigger": "Successful refund call with admin approval record"
       }
     ]
   },

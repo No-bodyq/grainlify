@@ -272,6 +272,40 @@ pub fn emit_funds_refunded(env: &Env, event: FundsRefunded) {
     env.events().publish(topics, event.clone());
 }
 
+/// Payload emitted when admin writes or updates a refund approval record.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundApprovalSet {
+    pub version: u32,
+    pub bounty_id: u64,
+    pub amount: i128,
+    pub recipient: Address,
+    pub mode: crate::RefundMode,
+    pub approved_by: Address,
+    pub approved_at: u64,
+}
+
+pub fn emit_refund_approval_set(env: &Env, event: RefundApprovalSet) {
+    let topics = (symbol_short!("r_appr"), event.bounty_id);
+    env.events().publish(topics, event);
+}
+
+/// Payload emitted when a stored refund approval is consumed by `refund`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RefundApprovalConsumed {
+    pub version: u32,
+    pub bounty_id: u64,
+    pub refunded_amount: i128,
+    pub refunded_to: Address,
+    pub consumed_at: u64,
+}
+
+pub fn emit_refund_approval_consumed(env: &Env, event: RefundApprovalConsumed) {
+    let topics = (symbol_short!("r_apcns"), event.bounty_id);
+    env.events().publish(topics, event);
+}
+
 // ── Oracle config event ───────────────────────────────────────────────────────
 
 /// Payload for the [`emit_oracle_config_updated`] event.
