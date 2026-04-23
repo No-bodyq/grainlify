@@ -830,7 +830,7 @@ fn test_deprecated_blocks_lock_funds() {
 #[test]
 fn test_maintenance_mode_blocks_lock() {
     let ctx = setup_init();
-    ctx.client.set_maintenance_mode(&true);
+    ctx.client.set_maintenance_mode(&true, &None);
     let r = ctx
         .client
         .try_lock_funds(&ctx.depositor, &1u64, &DEFAULT_AMOUNT, &FUTURE_DL);
@@ -882,7 +882,7 @@ fn test_deprecation_emits_event() {
 #[test]
 fn test_maintenance_mode_emits_event() {
     let ctx = setup_init();
-    ctx.client.set_maintenance_mode(&true);
+    ctx.client.set_maintenance_mode(&true, &None);
     let all = ctx.env.events().all();
     let data = find_data(&ctx.env, &all, symbol_short!("maint")).expect("maint event missing");
     let p: events::MaintenanceModeChanged = data.into_val(&ctx.env);

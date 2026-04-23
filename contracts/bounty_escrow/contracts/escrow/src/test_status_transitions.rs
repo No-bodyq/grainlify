@@ -172,12 +172,9 @@ fn test_refund_eligibility_eligible_with_admin_approval_before_deadline() {
     setup
         .escrow
         .lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
-    setup.escrow.approve_refund(
-        &bounty_id,
-        &500,
-        &custom_recipient,
-        &RefundMode::Partial,
-    );
+    setup
+        .escrow
+        .approve_refund(&bounty_id, &500, &custom_recipient, &RefundMode::Partial);
 
     let view = setup.escrow.get_refund_eligibility_view(&bounty_id);
     assert!(view.eligible);

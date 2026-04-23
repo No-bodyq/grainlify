@@ -874,6 +874,8 @@ pub struct MaintenanceModeChanged {
     pub enabled: bool,
     pub reason: Option<soroban_sdk::String>,
     pub admin: Address,
+    /// Optional reason provided by the admin for enabling/disabling maintenance.
+    pub reason: Option<soroban_sdk::String>,
     pub timestamp: u64,
 }
 
