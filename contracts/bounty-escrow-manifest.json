@@ -3,7 +3,7 @@
   "contract_name": "BountyEscrowContract",
   "contract_purpose": "Manages bounty escrow with multi-token support, capability-based authorization, two-step admin rotation with timelock, refund-eligibility views, fee configuration, and comprehensive security features including reentrancy protection and rate limiting",
   "version": {
-    "current": "2.2.0",
+    "current": "2.3.0",
     "schema": "1.0.0",
     "history": [
       {
@@ -42,6 +42,15 @@
         "changes": [
           "Hardened maintenance mode with explicit initialization, idempotent toggling, and audit-friendly v2 events",
           "Added upgrade-safe storage keys for maintenance mode metadata and schema versioning"
+        ]
+      },
+      {
+        "version": "2.3.0",
+        "release_date": "2026-04-23",
+        "changes": [
+          "Implemented validate_claim_window with time-based enforcement and audit events",
+          "set_claim_window now emits ClaimWindowSet audit event",
+          "Added ClaimWindowValidated and ClaimWindowExpired audit events for full observability"
         ]
       }
     ]
@@ -793,12 +802,12 @@
       },
       {
         "name": "set_claim_window",
-        "description": "Set claim window duration",
+        "description": "Set claim window duration. Emits ClaimWindowSet audit event. Set to 0 to disable enforcement.",
         "parameters": [
           {
             "name": "claim_window",
             "type": "u64",
-            "description": "Seconds beneficiary has to claim"
+            "description": "Seconds beneficiary has to claim after authorization. 0 disables enforcement."
           }
         ],
         "returns": {

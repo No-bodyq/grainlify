@@ -1682,3 +1682,61 @@ pub fn emit_queued_release_executed(env: &Env, event: QueuedReleaseExecuted) {
     let topics = (symbol_short!("hv_exec"), event.bounty_id);
     env.events().publish(topics, event);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// CLAIM WINDOW EVENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Emitted when the admin configures the global claim window duration.
+///
+/// ### Topics
+/// `("cw_set",)`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimWindowSet {
+    pub version: u32,
+    pub claim_window: u64,
+    pub set_by: Address,
+    pub timestamp: u64,
+}
+
+pub fn emit_claim_window_set(env: &Env, event: ClaimWindowSet) {
+    let topics = (symbol_short!("cw_set"),);
+    env.events().publish(topics, event);
+}
+
+/// Emitted when a claim passes the window validation check (audit trail).
+///
+/// ### Topics
+/// `("cw_ok", bounty_id)`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimWindowValidated {
+    pub version: u32,
+    pub bounty_id: u64,
+    pub now: u64,
+    pub expires_at: u64,
+}
+
+pub fn emit_claim_window_validated(env: &Env, event: ClaimWindowValidated) {
+    let topics = (symbol_short!("cw_ok"), event.bounty_id);
+    env.events().publish(topics, event);
+}
+
+/// Emitted when a claim is rejected because the claim window has expired.
+///
+/// ### Topics
+/// `("cw_exp", bounty_id)`
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ClaimWindowExpired {
+    pub version: u32,
+    pub bounty_id: u64,
+    pub now: u64,
+    pub expires_at: u64,
+}
+
+pub fn emit_claim_window_expired(env: &Env, event: ClaimWindowExpired) {
+    let topics = (symbol_short!("cw_exp"), event.bounty_id);
+    env.events().publish(topics, event);
+}
