@@ -32,12 +32,13 @@ use crate::events::{
     emit_batch_funds_locked, emit_batch_funds_released, emit_bounty_initialized,
     emit_deprecation_state_changed, emit_deterministic_selection, emit_funds_locked,
     emit_funds_locked_anon, emit_funds_refunded, emit_funds_released,
-    emit_maintenance_mode_changed, emit_notification_preferences_updated,
+    emit_maintenance_mode_changed, emit_maintenance_mode_changed_v2,
+    emit_notification_preferences_updated,
     emit_participant_filter_mode_changed, emit_risk_flags_updated, emit_ticket_claimed,
     emit_refund_approval_consumed, emit_refund_approval_set, emit_ticket_issued, BatchFundsLocked,
     BatchFundsReleased, BountyEscrowInitialized, ClaimCancelled, ClaimCreated, ClaimExecuted,
     CriticalOperationOutcome, DeprecationStateChanged, DeterministicSelectionDerived, FundsLocked,
-    FundsLockedAnon, FundsRefunded, FundsReleased, MaintenanceModeChanged,
+    FundsLockedAnon, FundsRefunded, FundsReleased, MaintenanceModeChanged, MaintenanceModeChangedV2,
     NotificationPreferencesUpdated, ParticipantFilterModeChanged, RefundApprovalConsumed,
     RefundApprovalSet, RefundTriggerType, RiskFlagsUpdated, TicketClaimed, TicketIssued,
     EVENT_VERSION_V2,
@@ -823,6 +824,12 @@ pub enum DataKey {
     NetworkId,
 
     MaintenanceMode, // bool flag
+    /// Timestamp when maintenance mode was last toggled.
+    MaintenanceModeUpdatedAt,
+    /// Admin that last toggled maintenance mode.
+    MaintenanceModeUpdatedBy,
+    /// Schema marker for maintenance mode hardening semantics.
+    MaintenanceModeSchemaVersion,
     /// Per-operation gas budget caps configured by the admin.
     /// See [`gas_budget::GasBudgetConfig`].
     GasBudgetConfig,
@@ -964,6 +971,7 @@ pub struct ReleaseApproval {
 }
 
 const REFUND_ELIGIBILITY_SCHEMA_VERSION_V1: u32 = 1;
+const MAINTENANCE_MODE_SCHEMA_VERSION_V1: u32 = 1;
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1188,6 +1196,20 @@ impl BountyEscrowContract {
             &DataKey::RefundEligibilitySchemaVersion,
             &REFUND_ELIGIBILITY_SCHEMA_VERSION_V1,
         );
+        // Upgrade-safe maintenance mode initialization (explicit key write).
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceMode, &false);
+        env.storage().instance().set(
+            &DataKey::MaintenanceModeSchemaVersion,
+            &MAINTENANCE_MODE_SCHEMA_VERSION_V1,
+        );
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceModeUpdatedAt, &env.ledger().timestamp());
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceModeUpdatedBy, &admin);
 
         events::emit_bounty_initialized(
             &env,
@@ -1887,11 +1909,14 @@ impl BountyEscrowContract {
 
     /// Check if an operation is paused
     fn check_paused(env: &Env, operation: Symbol) -> bool {
+        // HARDENING: Maintenance mode supersedes granular pause flags
+        // and halts ALL state-mutating operations globally.
+        if Self::is_maintenance_mode(env.clone()) {
+            return true;
+        }
+
         let flags = Self::get_pause_flags(env);
         if operation == symbol_short!("lock") {
-            if Self::is_maintenance_mode(env.clone()) {
-                return true;
-            }
             return flags.lock_paused;
         } else if operation == symbol_short!("release") {
             return flags.release_paused;
@@ -2030,21 +2055,54 @@ impl BountyEscrowContract {
     }
 
     /// Update maintenance mode (admin only)
-    pub fn set_maintenance_mode(env: Env, enabled: bool) -> Result<(), Error> {
+    pub fn set_maintenance_mode(
+        env: Env, 
+        enabled: bool, 
+        reason: Option<soroban_sdk::String>
+    ) -> Result<(), Error> {
         if !env.storage().instance().has(&DataKey::Admin) {
             return Err(Error::NotInitialized);
         }
         let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
         admin.require_auth();
 
+        let previous_enabled = env
+            .storage()
+            .instance()
+            .get(&DataKey::MaintenanceMode)
+            .unwrap_or(false);
+
+        // Idempotent behavior: if no state change, do not emit events.
+        if previous_enabled == enabled {
+            return Ok(());
+        }
+
         env.storage()
             .instance()
             .set(&DataKey::MaintenanceMode, &enabled);
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceModeUpdatedAt, &env.ledger().timestamp());
+        env.storage()
+            .instance()
+            .set(&DataKey::MaintenanceModeUpdatedBy, &admin);
 
         events::emit_maintenance_mode_changed(
             &env,
-            MaintenanceModeChanged {
+            events::MaintenanceModeChanged {
                 enabled,
+                reason,
+                admin: admin.clone(),
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+        emit_maintenance_mode_changed_v2(
+            &env,
+            MaintenanceModeChangedV2 {
+                version: EVENT_VERSION_V2,
+                previous_enabled,
+                enabled,
+                reason,
                 admin: admin.clone(),
                 timestamp: env.ledger().timestamp(),
             },
@@ -5566,6 +5624,84 @@ impl BountyEscrowContract {
 
         reentrancy_guard::release(&env);
         result
+    }
+
+    // ============================================================================
+    // RISK FLAGS GOVERNANCE
+    // ============================================================================
+
+    /// Updates the risk flags associated with a specific bounty.
+    ///
+    /// # Access Control
+    /// Admin-only.
+    ///
+    /// # Arguments
+    /// * `env` - The contract environment.
+    /// * `bounty_id` - The bounty identifier.
+    /// * `new_flags` - The new bitmask of risk flags to apply.
+    pub fn update_risk_flags(env: Env, bounty_id: u64, new_flags: u32) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+
+        if !env.storage().persistent().has(&DataKey::Escrow(bounty_id))
+            && !env.storage().persistent().has(&DataKey::EscrowAnon(bounty_id))
+        {
+            return Err(Error::BountyNotFound);
+        }
+
+        let mut metadata: EscrowMetadata = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Metadata(bounty_id))
+            .unwrap_or(EscrowMetadata {
+                repo_id: 0,
+                issue_id: 0,
+                bounty_type: soroban_sdk::String::from_str(&env, ""),
+                risk_flags: 0,
+                notification_prefs: 0,
+                reference_hash: None,
+            });
+
+        let previous_flags = metadata.risk_flags;
+        metadata.risk_flags = new_flags;
+
+        env.storage()
+            .persistent()
+            .set(&DataKey::Metadata(bounty_id), &metadata);
+
+        events::emit_risk_flags_updated(
+            &env,
+            events::RiskFlagsUpdated {
+                version: events::EVENT_VERSION_V2,
+                bounty_id,
+                previous_flags,
+                new_flags,
+                admin,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Retrieves the current risk flags for a given bounty.
+    pub fn get_risk_flags(env: Env, bounty_id: u64) -> Result<u32, Error> {
+        if !env.storage().persistent().has(&DataKey::Escrow(bounty_id))
+            && !env.storage().persistent().has(&DataKey::EscrowAnon(bounty_id))
+        {
+            return Err(Error::BountyNotFound);
+        }
+
+        let metadata: Option<EscrowMetadata> = env
+            .storage()
+            .persistent()
+            .get(&DataKey::Metadata(bounty_id));
+
+        Ok(metadata.map(|m| m.risk_flags).unwrap_or(0))
     }
 }
 impl traits::EscrowInterface for BountyEscrowContract {
