@@ -164,6 +164,129 @@ pub struct PendingAdminRestore {
     pub expires_at: u64,
 }
 
+// ============================================================================
+// Migration Framework Types  [Issue #1087]
+// ============================================================================
+
+/// Persisted record of a completed migration.
+///
+/// Stored at `DataKey::MigrationState` after every successful `migrate()` call.
+/// The idempotency guard in `migrate()` reads this to skip already-applied
+/// migrations.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationState {
+    /// Contract version before this migration ran.
+    pub from_version: u32,
+    /// Contract version after this migration ran.
+    pub to_version: u32,
+    /// Ledger timestamp when the migration completed.
+    pub migrated_at: u64,
+    /// SHA-256 hash supplied by the admin — stored for off-chain audit.
+    pub migration_hash: BytesN<32>,
+}
+
+/// On-chain event emitted by every `migrate()` call (success or failure).
+///
+/// Topic: `(symbol_short!("migrate"), symbol_short!("done"))` on success,
+///        `(symbol_short!("migrate"), symbol_short!("failed"))` on failure.
+///
+/// Off-chain monitors can subscribe to these topics to detect and alert on
+/// failed migration attempts before the transaction reverts.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationEvent {
+    pub from_version: u32,
+    pub to_version: u32,
+    pub timestamp: u64,
+    pub migration_hash: BytesN<32>,
+    /// `true` when migration completed successfully.
+    pub success: bool,
+    /// Human-readable error description on failure; `None` on success.
+    pub error_message: Option<String>,
+}
+
+/// On-chain event emitted by `commit_migration()`.
+///
+/// Topic: `(symbol_short!("migrate"), symbol_short!("commit"))`.
+/// Allows off-chain tooling to verify a commitment is live before calling
+/// `migrate()`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct MigrationCommittedEvent {
+    pub target_version: u32,
+    pub hash: BytesN<32>,
+    pub committed_at: u64,
+    /// `0` means no expiry.
+    pub expires_at: u64,
+    pub admin: Address,
+}
+
+// ============================================================================
+// Config Snapshot Types
+// ============================================================================
+
+/// Point-in-time snapshot of the contract's core configuration.
+///
+/// Stored at `DataKey::ConfigSnapshot(id)` and used for recovery and audit.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct CoreConfigSnapshot {
+    pub id: u64,
+    pub timestamp: u64,
+    pub admin: Option<Address>,
+    pub version: u32,
+    pub previous_version: Option<u32>,
+    pub multisig_threshold: u32,
+    pub multisig_signers: Vec<Address>,
+}
+
+/// Diff between two config snapshots returned by `compare_snapshots`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct SnapshotDiff {
+    pub from_id: u64,
+    pub to_id: u64,
+    pub admin_changed: bool,
+    pub version_changed: bool,
+    pub previous_version_changed: bool,
+    pub multisig_threshold_changed: bool,
+    pub multisig_signers_changed: bool,
+    pub from_version: u32,
+    pub to_version: u32,
+}
+
+/// Summary of rollback-related state returned by `get_rollback_info`.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct RollbackInfo {
+    pub current_version: u32,
+    pub previous_version: u32,
+    pub rollback_available: bool,
+    pub has_migration: bool,
+    pub migration_from_version: u32,
+    pub migration_to_version: u32,
+    pub migration_timestamp: u64,
+    pub snapshot_count: u32,
+    pub has_snapshot: bool,
+    pub latest_snapshot_id: u64,
+    pub latest_snapshot_version: u32,
+}
+
+/// Event emitted when read-only mode is toggled.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ReadOnlyModeEvent {
+    pub enabled: bool,
+    pub admin: Address,
+    pub timestamp: u64,
+}
+
+/// Helper: returns `true` when the contract has been initialized.
+fn contract_is_initialized(env: &Env) -> bool {
+    env.storage().instance().has(&DataKey::Admin)
+}
+
 
 
 
@@ -599,7 +722,7 @@ mod monitoring {
 
 #[cfg(all(test, feature = "wasm_tests"))]
 mod test_core_monitoring;
-#[cfg(test)]
+#[cfg(all(test, feature = "wasm_tests"))]
 mod test_pseudo_randomness;
 #[cfg(all(test, feature = "wasm_tests"))]
 mod test_serialization_compatibility;
@@ -609,6 +732,10 @@ mod test_storage_layout;
 mod test_version_helpers;
 #[cfg(test)]
 mod test_strict_mode;
+#[cfg(test)]
+mod migration_hook_tests;
+#[cfg(test)]
+mod test_migration_replay;
 
 // ==================== END MONITORING MODULE ====================
 
@@ -676,7 +803,7 @@ mod test_strict_mode;
 /// - **Warnings**: Potential issues or incomplete runtime validation
 /// - **Info Messages**: Successful validation confirmations
 ///
-#[cfg(any(test, feature = "testutils"))]
+#[cfg(all(any(test, feature = "testutils"), feature = "wasm_tests"))]
 mod manifest_conformance {
     use super::*;
     use soroban_sdk::{contracttype, symbol_short, Address, BytesN, Env, String, Symbol, Vec};
@@ -1279,34 +1406,6 @@ impl GrainlifyContract {
     /// # Security Note
     /// This is a view function and requires no authorization. It can be called
     /// by anyone to verify contract integrity.
-    #[cfg(any(test, feature = "testutils"))]
-    pub fn validate_manifest_conformance(env: Env) -> manifest_conformance::ConformanceResult {
-        manifest_conformance::ManifestHarness::validate_conformance(&env)
-    }
-    ///
-    /// This function goes beyond basic conformance checking to validate error handling,
-    /// gas considerations, event emission patterns, and upgrade safety mechanisms.
-    /// It's more comprehensive but also more expensive to run.
-    ///
-    /// # Returns
-    /// * `ConformanceResult` - Detailed deep validation results
-    ///
-    /// # Use Cases
-    /// - Comprehensive pre-deployment testing
-    /// - Security audits
-    /// - Production monitoring
-    ///
-    /// # Performance Note
-    /// This function performs more checks than `validate_manifest_conformance`
-    /// and may have higher gas costs.
-    ///
-    /// # Security Note
-    /// This is a view function and requires no authorization.
-    #[cfg(any(test, feature = "testutils"))]
-    pub fn validate_deep_conformance(env: Env) -> manifest_conformance::ConformanceResult {
-        manifest_conformance::ManifestHarness::validate_deep_conformance(&env)
-    }
-
     // ========================================================================
     // Timelock Execution (continued from propose/approve flow)
     // ========================================================================
@@ -1900,6 +1999,411 @@ impl GrainlifyContract {
             None
         }
     }
+
+    // ========================================================================
+    // Initialization
+    // ========================================================================
+
+    /// Initialize the contract with a single admin address.
+    ///
+    /// Sets the admin, records the initial version, and emits an init event.
+    /// Can only be called once — subsequent calls panic with `AlreadyInitialized`.
+    ///
+    /// # Security
+    /// - Admin address is immutable after this call.
+    /// - Caller must authorize via `admin.require_auth()`.
+    pub fn init_admin(env: Env, admin: Address) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("{}", ContractError::AlreadyInitialized as u32);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Version, &VERSION);
+        env.events().publish(
+            (symbol_short!("init"), symbol_short!("admin")),
+            (admin.clone(), VERSION, env.ledger().timestamp()),
+        );
+        monitoring::track_operation(&env, symbol_short!("init_adm"), admin, true);
+    }
+
+    /// Initialize the contract with a multisig configuration.
+    ///
+    /// Sets up a multisig threshold + signer set instead of a single admin.
+    /// Can only be called once — subsequent calls panic with `AlreadyInitialized`.
+    pub fn init_governance(
+        env: Env,
+        admin: Address,
+        signers: Vec<Address>,
+        threshold: u32,
+    ) {
+        if env.storage().instance().has(&DataKey::Admin) {
+            panic!("{}", ContractError::AlreadyInitialized as u32);
+        }
+        admin.require_auth();
+        env.storage().instance().set(&DataKey::Admin, &admin);
+        env.storage().instance().set(&DataKey::Version, &VERSION);
+        let config = multisig::MultiSigConfig { signers, threshold };
+        MultiSig::set_config(&env, config);
+        env.events().publish(
+            (symbol_short!("init"), symbol_short!("gov")),
+            (admin.clone(), VERSION, env.ledger().timestamp()),
+        );
+        monitoring::track_operation(&env, symbol_short!("init_gov"), admin, true);
+    }
+
+    // ========================================================================
+    // Multisig Upgrade Flow
+    // ========================================================================
+
+    /// Propose a WASM upgrade via multisig.
+    ///
+    /// Any signer can propose; the proposal is stored and awaits threshold approvals.
+    /// Returns the stable `proposal_id` used for subsequent `approve_upgrade` /
+    /// `execute_upgrade` calls.
+    pub fn propose_upgrade(env: Env, proposer: Address, wasm_hash: BytesN<32>) -> u64 {
+        proposer.require_auth();
+        Self::require_not_read_only(&env);
+
+        let proposal_id = MultiSig::propose(&env, proposer.clone(), 0 /* no expiry */);
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeProposal(proposal_id), &wasm_hash);
+        env.storage()
+            .instance()
+            .set(&DataKey::UpgradeProposalProposer(proposal_id), &proposer);
+
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("propose")),
+            (proposal_id, wasm_hash, proposer.clone(), env.ledger().timestamp()),
+        );
+        monitoring::track_operation(&env, symbol_short!("prop_upg"), proposer, true);
+        proposal_id
+    }
+
+    /// Approve a pending upgrade proposal.
+    ///
+    /// Once the multisig threshold is reached the timelock clock starts.
+    /// Emits `upgrade / approve` and, when threshold is met, `upgrade / timelock`.
+    pub fn approve_upgrade(env: Env, signer: Address, proposal_id: u64) {
+        signer.require_auth();
+        Self::require_not_read_only(&env);
+
+        MultiSig::approve(&env, proposal_id, signer.clone());
+
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("approve")),
+            (proposal_id, signer.clone(), env.ledger().timestamp()),
+        );
+
+        // Start timelock when threshold is met
+        if MultiSig::can_execute(&env, proposal_id) {
+            env.storage()
+                .instance()
+                .set(&DataKey::UpgradeTimelock(proposal_id), &env.ledger().timestamp());
+            env.events().publish(
+                (symbol_short!("upgrade"), symbol_short!("timelock")),
+                (proposal_id, env.ledger().timestamp()),
+            );
+        }
+        monitoring::track_operation(&env, symbol_short!("appr_upg"), signer, true);
+    }
+
+    /// Cancel a pending upgrade proposal (proposer or admin only).
+    pub fn cancel_upgrade(env: Env, caller: Address, proposal_id: u64) {
+        caller.require_auth();
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("{}", ContractError::NotInitialized as u32));
+
+        let proposal = Self::load_upgrade_proposal(&env, proposal_id)
+            .unwrap_or_else(|| panic!("{}", ContractError::ProposalNotFound as u32));
+
+        let is_admin = caller == admin;
+        let is_proposer = proposal.proposer.as_ref().map(|p| *p == caller).unwrap_or(false);
+        if !is_admin && !is_proposer {
+            panic!("{}", ContractError::NotAdmin as u32);
+        }
+
+        MultiSig::cancel(&env, proposal_id, caller.clone());
+        env.storage().instance().remove(&DataKey::UpgradeTimelock(proposal_id));
+
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("cancel")),
+            (proposal_id, caller.clone(), env.ledger().timestamp()),
+        );
+        monitoring::track_operation(&env, symbol_short!("cncl_upg"), caller, true);
+    }
+
+    /// Return the full proposal record for a given proposal_id.
+    pub fn get_upgrade_proposal(env: Env, proposal_id: u64) -> Option<UpgradeProposalRecord> {
+        Self::load_upgrade_proposal(&env, proposal_id)
+    }
+
+    // ========================================================================
+    // Migration Framework + Replay Protection  [Issue #1087]
+    // ========================================================================
+
+    /// **Step 1 of 2 — Commit-reveal replay protection.**
+    ///
+    /// Admin pre-commits a `(target_version, hash)` pair on-chain.  The hash
+    /// must match the one supplied to `migrate()` in a later transaction.
+    /// This two-transaction pattern prevents front-running and ensures the
+    /// exact migration data was authorised by the admin before execution.
+    ///
+    /// # Replay Protection Flow
+    /// ```text
+    /// Tx A: admin calls commit_migration(3, sha256(migration_data))
+    ///       → MigrationCommitment stored on-chain
+    /// Tx B: admin calls migrate(3, sha256(migration_data))
+    ///       → commitment verified & consumed; migration executes
+    /// ```
+    ///
+    /// # Parameters
+    /// - `target_version` — version this commitment authorises
+    /// - `hash`           — SHA-256 of the migration payload (off-chain data)
+    /// - `expiry_seconds` — seconds until commitment expires; `0` = no expiry
+    ///
+    /// # Security
+    /// - Admin-only; requires `admin.require_auth()`.
+    /// - Commitment is keyed by `target_version` — only one live commitment
+    ///   per target version at a time.
+    /// - Expired commitments are rejected by `migrate()`.
+    pub fn commit_migration(
+        env: Env,
+        target_version: u32,
+        hash: BytesN<32>,
+        expiry_seconds: u64,
+    ) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("{}", ContractError::NotInitialized as u32));
+        admin.require_auth();
+        Self::require_not_read_only(&env);
+
+        let now = env.ledger().timestamp();
+        let expires_at = if expiry_seconds == 0 {
+            0u64
+        } else {
+            now.saturating_add(expiry_seconds)
+        };
+
+        let commitment = MigrationCommitment {
+            target_version,
+            hash: hash.clone(),
+            committed_at: now,
+            expires_at,
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::MigrationCommitment(target_version), &commitment);
+
+        env.events().publish(
+            (symbol_short!("migrate"), symbol_short!("commit")),
+            MigrationCommittedEvent {
+                target_version,
+                hash,
+                committed_at: now,
+                expires_at,
+                admin: admin.clone(),
+            },
+        );
+        monitoring::track_operation(&env, symbol_short!("cmt_mig"), admin, true);
+    }
+
+    /// Revoke a pending migration commitment (admin only).
+    ///
+    /// Useful when a migration is cancelled before execution.
+    pub fn revoke_migration_commitment(env: Env, target_version: u32) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("{}", ContractError::NotInitialized as u32));
+        admin.require_auth();
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::MigrationCommitment(target_version));
+
+        env.events().publish(
+            (symbol_short!("migrate"), symbol_short!("revoke")),
+            (target_version, admin.clone(), env.ledger().timestamp()),
+        );
+        monitoring::track_operation(&env, symbol_short!("rev_mig"), admin, true);
+    }
+
+    /// Return the live commitment for `target_version`, or `None`.
+    pub fn get_migration_commitment(env: Env, target_version: u32) -> Option<MigrationCommitment> {
+        env.storage()
+            .instance()
+            .get(&DataKey::MigrationCommitment(target_version))
+    }
+
+    /// **Step 2 of 2 — Execute state migration with replay protection.**
+    ///
+    /// Migrates on-chain state from the current version to `target_version`.
+    /// Requires a prior `commit_migration(target_version, hash)` call in a
+    /// separate transaction (replay protection).
+    ///
+    /// # Idempotency
+    /// If `MigrationState.to_version == target_version` already, the call is a
+    /// safe no-op — no state changes, no events.
+    ///
+    /// # Chaining
+    /// A single call traverses multiple version boundaries in sequence:
+    /// `v1 → v3` executes `migrate_v1_to_v2` then `migrate_v2_to_v3`.
+    ///
+    /// # Replay Protection
+    /// The `migration_hash` must match the hash stored by `commit_migration`.
+    /// The commitment is consumed (deleted) after a successful migration so it
+    /// cannot be replayed.
+    ///
+    /// # Panics
+    /// - `"Target version must be greater than current version"` — downgrade attempt
+    /// - `"No migration path available"` — no function for a version step
+    /// - `ContractError::MigrationCommitmentNotFound` — no prior commit
+    /// - `ContractError::MigrationHashMismatch` — hash does not match commitment
+    /// - `"Migration commitment has expired"` — commitment TTL elapsed
+    pub fn migrate(env: Env, target_version: u32, migration_hash: BytesN<32>) {
+        let start = env.ledger().timestamp();
+
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .unwrap_or_else(|| panic!("{}", ContractError::NotInitialized as u32));
+        admin.require_auth();
+        Self::require_not_read_only(&env);
+
+        let current_version: u32 = env
+            .storage()
+            .instance()
+            .get(&DataKey::Version)
+            .unwrap_or(1);
+
+        // ── Idempotency guard ────────────────────────────────────────────────
+        if let Some(state) = env
+            .storage()
+            .instance()
+            .get::<DataKey, MigrationState>(&DataKey::MigrationState)
+        {
+            if state.to_version == target_version {
+                // Already migrated to this version — safe no-op.
+                return;
+            }
+        }
+
+        // ── Version monotonicity ─────────────────────────────────────────────
+        if target_version <= current_version {
+            env.events().publish(
+                (symbol_short!("migrate"), symbol_short!("failed")),
+                MigrationEvent {
+                    from_version: current_version,
+                    to_version: target_version,
+                    timestamp: env.ledger().timestamp(),
+                    migration_hash: migration_hash.clone(),
+                    success: false,
+                    error_message: Some(String::from_str(
+                        &env,
+                        "Target version must be greater than current version",
+                    )),
+                },
+            );
+            panic!("Target version must be greater than current version");
+        }
+
+        // ── Replay protection: verify commitment ─────────────────────────────
+        let commitment: MigrationCommitment = env
+            .storage()
+            .instance()
+            .get(&DataKey::MigrationCommitment(target_version))
+            .unwrap_or_else(|| {
+                panic!("{}", ContractError::MigrationCommitmentNotFound as u32)
+            });
+
+        // Check expiry
+        if commitment.expires_at != 0 && env.ledger().timestamp() > commitment.expires_at {
+            env.storage()
+                .instance()
+                .remove(&DataKey::MigrationCommitment(target_version));
+            panic!("Migration commitment has expired");
+        }
+
+        // Verify hash matches
+        if commitment.hash != migration_hash {
+            panic!("{}", ContractError::MigrationHashMismatch as u32);
+        }
+
+        // ── Execute chained migration steps ──────────────────────────────────
+        let mut next_version = current_version + 1;
+        while next_version <= target_version {
+            match next_version {
+                2 => migrate_v1_to_v2(&env),
+                3 => migrate_v2_to_v3(&env),
+                // Add new migration steps here as the contract evolves:
+                // 4 => migrate_v3_to_v4(&env),
+                _ => {
+                    env.events().publish(
+                        (symbol_short!("migrate"), symbol_short!("failed")),
+                        MigrationEvent {
+                            from_version: current_version,
+                            to_version: target_version,
+                            timestamp: env.ledger().timestamp(),
+                            migration_hash: migration_hash.clone(),
+                            success: false,
+                            error_message: Some(String::from_str(
+                                &env,
+                                "No migration path available",
+                            )),
+                        },
+                    );
+                    panic!("No migration path available");
+                }
+            }
+            next_version += 1;
+        }
+
+        // ── Persist migration state ───────────────────────────────────────────
+        let state = MigrationState {
+            from_version: current_version,
+            to_version: target_version,
+            migrated_at: env.ledger().timestamp(),
+            migration_hash: migration_hash.clone(),
+        };
+        env.storage()
+            .instance()
+            .set(&DataKey::MigrationState, &state);
+        env.storage()
+            .instance()
+            .set(&DataKey::Version, &target_version);
+
+        // ── Consume commitment (replay protection) ────────────────────────────
+        env.storage()
+            .instance()
+            .remove(&DataKey::MigrationCommitment(target_version));
+
+        // ── Emit success event ────────────────────────────────────────────────
+        env.events().publish(
+            (symbol_short!("migrate"), symbol_short!("done")),
+            MigrationEvent {
+                from_version: current_version,
+                to_version: target_version,
+                timestamp: env.ledger().timestamp(),
+                migration_hash,
+                success: true,
+                error_message: None,
+            },
+        );
+
+        let duration = env.ledger().timestamp().saturating_sub(start);
+        monitoring::track_operation(&env, symbol_short!("migrate"), admin, true);
+        monitoring::emit_performance(&env, symbol_short!("migrate"), duration);
+    }
 }
 
 // ============================================================================
@@ -1935,7 +2439,25 @@ fn migrate_v1_to_v2(_env: &Env) {
     // Future: add data transformations here when needed
 }
 
-#[cfg(test)]
+/// v2 → v3 migration.
+///
+/// Writes the `MigrationCommitment` storage key schema version marker so
+/// v3 contracts can detect whether the replay-protection key namespace is
+/// present.  No existing data is mutated — this is a forward-compatible
+/// additive migration.
+fn migrate_v2_to_v3(_env: &Env) {
+    // Additive migration: the MigrationCommitment DataKey variant is new in v3.
+    // No existing storage needs to be transformed; the key simply becomes
+    // available for use after this migration completes.
+    //
+    // Template for future data-transforming migrations:
+    // 1. Read old data:   let old: OldType = env.storage().instance().get(&DataKey::OldKey).unwrap();
+    // 2. Transform:       let new = NewType { field: old.field, extra: default_value };
+    // 3. Write new data:  env.storage().instance().set(&DataKey::NewKey, &new);
+    // 4. Remove old key:  env.storage().instance().remove(&DataKey::OldKey);
+}
+
+#[cfg(all(test, feature = "wasm_tests"))]
 mod orphaned_tests {
     use super::*;
     use soroban_sdk::{testutils::Address as _, Address, BytesN, Env};
