@@ -1,7 +1,7 @@
 {
   "$schema": "./contract-manifest-schema.json",
   "contract_name": "BountyEscrowContract",
-  "contract_purpose": "Manages bounty escrow with multi-token support, capability-based authorization, two-step admin rotation with timelock, refund-eligibility views, fee configuration, and comprehensive security features including reentrancy protection and rate limiting",
+  "contract_purpose": "Manages bounty escrow with multi-token support, capability-based authorization, two-step admin rotation with timelock, refund-eligibility views, fee configuration, participant filter pagination with audit events, and comprehensive security features including reentrancy protection and rate limiting",
   "version": {
     "current": "2.4.0",
     "schema": "1.0.0",
@@ -58,17 +58,13 @@
       },
       {
         "version": "2.4.0",
-        "release_date": "2026-04-24",
+        "release_date": "2026-04-23",
         "changes": [
-          "Implemented high-value release timelock queue with clear semantics",
-          "release_funds now queues releases to DataKey::QueuedRelease(bounty_id) when amount >= configured threshold instead of transferring immediately",
-          "Added execute_queued_release: permissionless execution after timelock elapses, performs actual token transfer and marks escrow Released",
-          "Added cancel_queued_release: admin-only cancellation that removes queue entry and leaves escrow Locked",
-          "Added TimelockNotElapsed (53) and ReleaseAlreadyQueued (54) error codes",
-          "Added HighValueConfig and QueuedRelease DataKey variants for upgrade-safe storage",
-          "Added ReleaseQueueCancelled audit event emitted on cancel_queued_release",
-          "set_high_value_config now uses DataKey::HighValueConfig for upgrade-safe storage",
-          "All queue operations follow CEI ordering: state mutations before token transfers"
+          "query_whitelist and query_blocklist now return ParticipantListPage with items, total, offset, and has_more fields for clear pagination semantics",
+          "Added get_whitelist_count and get_blocklist_count view functions for O(1) total-count queries",
+          "Added ParticipantFilterQueried audit event emitted on every query_whitelist/query_blocklist call for off-chain audit trails",
+          "Limit argument silently capped at MAX_PARTICIPANT_FILTER_PAGE_SIZE (50) to bound per-call ledger cost",
+          "Added ParticipantListSchemaVersion storage key initialized on contract init for upgrade-safe storage versioning"
         ]
       }
     ]
@@ -361,8 +357,32 @@
         "gas_estimate": "low"
       },
       {
+        "name": "get_whitelist_count",
+        "description": "Return total number of allowlisted addresses",
+        "parameters": [],
+        "returns": {
+          "type": "u32",
+          "description": "Total count of allowlisted addresses"
+        },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "get_blocklist_count",
+        "description": "Return total number of blocklisted addresses",
+        "parameters": [],
+        "returns": {
+          "type": "u32",
+          "description": "Total count of blocklisted addresses"
+        },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
         "name": "query_whitelist",
-        "description": "Get paginated allowlist participants",
+        "description": "Get paginated allowlist participants with total count and has_more metadata. Limit silently capped at 50.",
         "parameters": [
           {
             "name": "offset",
@@ -372,12 +392,12 @@
           {
             "name": "limit",
             "type": "u32",
-            "description": "Maximum number of results"
+            "description": "Maximum number of results (capped at 50)"
           }
         ],
         "returns": {
-          "type": "Vec<Address>",
-          "description": "Allowlisted participant addresses"
+          "type": "ParticipantListPage",
+          "description": "Page of allowlisted addresses with items, total, offset, and has_more fields"
         },
         "authorization": "any",
         "pausable": false,
@@ -385,7 +405,7 @@
       },
       {
         "name": "query_blocklist",
-        "description": "Get paginated blocklist participants",
+        "description": "Get paginated blocklist participants with total count and has_more metadata. Limit silently capped at 50.",
         "parameters": [
           {
             "name": "offset",
@@ -395,12 +415,12 @@
           {
             "name": "limit",
             "type": "u32",
-            "description": "Maximum number of results"
+            "description": "Maximum number of results (capped at 50)"
           }
         ],
         "returns": {
-          "type": "Vec<Address>",
-          "description": "Blocklisted participant addresses"
+          "type": "ParticipantListPage",
+          "description": "Page of blocklisted addresses with items, total, offset, and has_more fields"
         },
         "authorization": "any",
         "pausable": false,
@@ -919,21 +939,19 @@
         "gas_estimate": "low"
       },
       {
-        "name": "execute_queued_release",
-        "description": "Execute a queued high-value release after the timelock has elapsed. Permissionless — anyone may call once executable_at is reached.",
+        "name": "set_batch_size_caps",
+        "description": "Set independent runtime caps for batch_lock_funds and batch_release_funds. Both caps must satisfy 1 <= cap <= MAX_BATCH_SIZE (20). Emits BatchSizeCapsUpdated.",
         "parameters": [
-          { "name": "bounty_id", "type": "u64", "description": "Bounty identifier" }
-        ],
-        "returns": { "type": "()", "description": "Empty on success" },
-        "authorization": "any",
-        "pausable": false,
-        "gas_estimate": "medium"
-      },
-      {
-        "name": "cancel_queued_release",
-        "description": "Cancel a pending queued release (admin only). Escrow remains Locked.",
-        "parameters": [
-          { "name": "bounty_id", "type": "u64", "description": "Bounty identifier" }
+          {
+            "name": "lock_cap",
+            "type": "u32",
+            "description": "Maximum items allowed in a single batch_lock_funds call (1..=20)"
+          },
+          {
+            "name": "release_cap",
+            "type": "u32",
+            "description": "Maximum items allowed in a single batch_release_funds call (1..=20)"
+          }
         ],
         "returns": { "type": "()", "description": "Empty on success" },
         "authorization": "admin",
@@ -942,6 +960,26 @@
       }
     ]
   },
+  "view_entrypoints_fee_routing": [
+    {
+      "name": "get_fee_routing",
+      "description": "Return the per-bounty fee routing override for bounty_id, or None when no override is set.",
+      "parameters": [
+        {
+          "name": "bounty_id",
+          "type": "u64",
+          "description": "Bounty identifier"
+        }
+      ],
+      "returns": {
+        "type": "Option<PerBountyFeeRouting>",
+        "description": "Per-bounty routing config, or None if using global routing."
+      },
+      "authorization": "any",
+      "pausable": false,
+      "gas_estimate": "low"
+    }
+  ],
   "configuration": {
     "parameters": [
       {
@@ -1014,6 +1052,14 @@
         "description": "Delay in seconds before a pending admin can accept a rotation",
         "constraints": "3600 <= value <= 2592000",
         "admin_only": true
+      },
+      {
+        "name": "MAX_PARTICIPANT_FILTER_PAGE_SIZE",
+        "type": "u32",
+        "default_value": "50",
+        "description": "Hard upper bound on addresses returned per query_whitelist / query_blocklist call. Callers passing a larger limit are silently capped.",
+        "constraints": "value = 50",
+        "admin_only": false
       }
     ],
     "storage_keys": [
@@ -1114,16 +1160,10 @@
         "data_structure": "Vec<Address>"
       },
       {
-        "name": "HighValueConfig",
+        "name": "ParticipantListSchemaVersion",
         "type": "instance",
-        "description": "High-value release timelock configuration (threshold and duration)",
-        "data_structure": "HighValueConfig"
-      },
-      {
-        "name": "QueuedRelease",
-        "type": "persistent",
-        "description": "Per-bounty queued release record for high-value timelock, keyed by bounty_id",
-        "data_structure": "QueuedRelease"
+        "description": "Upgrade-safe marker for participant list (whitelist/blocklist) storage semantics. Initialized to 1 during init().",
+        "data_structure": "u32"
       }
     ]
   },
@@ -1518,54 +1558,41 @@
         "trigger": "Admin toggles maintenance mode (state change only)"
       },
       {
-        "name": "ReleaseQueued",
-        "description": "High-value release queued for timelock delay",
+        "name": "ParticipantFilterQueried",
+        "description": "Emitted on every query_whitelist / query_blocklist call for off-chain audit trails",
         "data": [
-          { "name": "version", "type": "u32", "description": "Always EVENT_VERSION_V2" },
-          { "name": "bounty_id", "type": "u64", "description": "Bounty identifier" },
-          { "name": "contributor", "type": "Address", "description": "Intended recipient" },
-          { "name": "amount", "type": "i128", "description": "Amount to be released" },
-          { "name": "executable_at", "type": "u64", "description": "Timestamp after which execute_queued_release may be called" },
-          { "name": "timestamp", "type": "u64", "description": "Ledger timestamp of queuing" }
+          {
+            "name": "list_type",
+            "type": "ParticipantFilterListType",
+            "description": "Which list was queried (Allowlist or Blocklist)"
+          },
+          {
+            "name": "offset",
+            "type": "u32",
+            "description": "Zero-based start index used in this query"
+          },
+          {
+            "name": "limit",
+            "type": "u32",
+            "description": "Effective limit after applying MAX_PARTICIPANT_FILTER_PAGE_SIZE cap"
+          },
+          {
+            "name": "result_count",
+            "type": "u32",
+            "description": "Number of addresses returned in this page"
+          },
+          {
+            "name": "total",
+            "type": "u32",
+            "description": "Total number of addresses in the list at query time"
+          },
+          {
+            "name": "timestamp",
+            "type": "u64",
+            "description": "Ledger timestamp"
+          }
         ],
-        "trigger": "release_funds called when amount >= high-value threshold"
-      },
-      {
-        "name": "QueuedReleaseExecuted",
-        "description": "Queued high-value release executed after timelock elapsed",
-        "data": [
-          { "name": "version", "type": "u32", "description": "Always EVENT_VERSION_V2" },
-          { "name": "bounty_id", "type": "u64", "description": "Bounty identifier" },
-          { "name": "contributor", "type": "Address", "description": "Recipient of funds" },
-          { "name": "amount", "type": "i128", "description": "Amount transferred" },
-          { "name": "timestamp", "type": "u64", "description": "Ledger timestamp of execution" }
-        ],
-        "trigger": "execute_queued_release called after executable_at"
-      },
-      {
-        "name": "ReleaseQueueCancelled",
-        "description": "Admin cancelled a pending queued release",
-        "data": [
-          { "name": "version", "type": "u32", "description": "Always EVENT_VERSION_V2" },
-          { "name": "bounty_id", "type": "u64", "description": "Bounty identifier" },
-          { "name": "contributor", "type": "Address", "description": "Intended recipient that was cancelled" },
-          { "name": "amount", "type": "i128", "description": "Amount that was queued" },
-          { "name": "admin", "type": "Address", "description": "Admin who cancelled" },
-          { "name": "timestamp", "type": "u64", "description": "Ledger timestamp of cancellation" }
-        ],
-        "trigger": "cancel_queued_release called by admin"
-      },
-      {
-        "name": "HighValueConfigUpdated",
-        "description": "High-value release timelock configuration updated",
-        "data": [
-          { "name": "version", "type": "u32", "description": "Always EVENT_VERSION_V2" },
-          { "name": "admin", "type": "Address", "description": "Admin who updated the config" },
-          { "name": "threshold", "type": "i128", "description": "New threshold amount" },
-          { "name": "duration", "type": "u64", "description": "New timelock duration in seconds" },
-          { "name": "timestamp", "type": "u64", "description": "Ledger timestamp" }
-        ],
-        "trigger": "set_high_value_config called by admin"
+        "trigger": "Every call to query_whitelist or query_blocklist"
       }
     ]
   },
@@ -1707,7 +1734,8 @@
         "test_metadata_tagging.rs",
         "test_partial_payout_rounding.rs",
         "test_gas.rs",
-        "test_analytics_monitoring.rs"
+        "test_analytics_monitoring.rs",
+        "test_filter_pagination.rs"
       ]
     },
     "test_scenarios": [
