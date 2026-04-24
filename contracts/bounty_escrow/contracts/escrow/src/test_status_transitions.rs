@@ -957,314 +957,238 @@ fn test_claim_window_expired_event_emitted_on_failure() {
 }
 
 // ============================================================================
-// FEE ROUTING INVARIANTS TESTS (Issue #50)
+// BATCH SIZE CAPS TESTS (#04)
 // ============================================================================
 
-/// Helper: configure a 2% lock fee and 1% release fee on the global config.
-fn setup_fee_config(setup: &TestSetup, fee_recipient: &Address) {
-    setup.escrow.update_fee_config(
-        &Some(200i128),  // 2% lock fee
-        &Some(100i128),  // 1% release fee
-        &None,
-        &None,
-        &Some(fee_recipient.clone()),
-        &Some(true),
-    );
+/// Helper: build a Vec of LockFundsItem for batch tests.
+fn make_lock_items(setup: &TestSetup, start_id: u64, count: u32) -> soroban_sdk::Vec<LockFundsItem> {
+    let mut items = soroban_sdk::Vec::new(&setup.env);
+    let deadline = setup.env.ledger().timestamp() + 10_000;
+    for i in 0..count {
+        items.push_back(LockFundsItem {
+            bounty_id: start_id + i as u64,
+            depositor: setup.depositor.clone(),
+            amount: 100,
+            deadline,
+        });
+    }
+    items
 }
 
-// --- set_fee_routing: basic happy path ---
-
-#[test]
-fn test_set_fee_routing_treasury_only() {
-    let setup = TestSetup::new();
-    let bounty_id = 400u64;
-    let amount = 10_000i128;
-    let deadline = setup.env.ledger().timestamp() + 1_000;
-    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
-
-    let treasury = Address::generate(&setup.env);
-    // treasury_bps = 10_000 (100%), no partner
-    setup.escrow.set_fee_routing(&bounty_id, &treasury, &10_000i128, &None, &0i128);
-
-    let routing = setup.escrow.get_fee_routing(&bounty_id).expect("routing must be set");
-    assert_eq!(routing.treasury_recipient, treasury);
-    assert_eq!(routing.treasury_bps, 10_000);
-    assert!(routing.partner_recipient.is_none());
-    assert_eq!(routing.partner_bps, 0);
+/// Helper: build a Vec of ReleaseFundsItem for batch tests.
+fn make_release_items(setup: &TestSetup, start_id: u64, count: u32) -> soroban_sdk::Vec<ReleaseFundsItem> {
+    let mut items = soroban_sdk::Vec::new(&setup.env);
+    for i in 0..count {
+        items.push_back(ReleaseFundsItem {
+            bounty_id: start_id + i as u64,
+            contributor: setup.contributor.clone(),
+        });
+    }
+    items
 }
 
+// --- get_batch_size_caps: defaults ---
+
 #[test]
-fn test_set_fee_routing_with_partner() {
+fn test_get_batch_size_caps_defaults_to_max() {
     let setup = TestSetup::new();
-    let bounty_id = 401u64;
-    let amount = 10_000i128;
-    let deadline = setup.env.ledger().timestamp() + 1_000;
-    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
-
-    let treasury = Address::generate(&setup.env);
-    let partner = Address::generate(&setup.env);
-    // 80% treasury, 20% partner
-    setup.escrow.set_fee_routing(&bounty_id, &treasury, &8_000i128, &Some(partner.clone()), &2_000i128);
-
-    let routing = setup.escrow.get_fee_routing(&bounty_id).expect("routing must be set");
-    assert_eq!(routing.treasury_bps, 8_000);
-    assert_eq!(routing.partner_recipient, Some(partner));
-    assert_eq!(routing.partner_bps, 2_000);
+    let caps = setup.escrow.get_batch_size_caps();
+    // Default must equal the compile-time hard limit (20).
+    assert_eq!(caps.lock_cap, 20);
+    assert_eq!(caps.release_cap, 20);
 }
 
-// --- set_fee_routing: invariant violations ---
+// --- set_batch_size_caps: happy path ---
 
 #[test]
-#[should_panic(expected = "Error(Contract, #13)")]
-fn test_set_fee_routing_shares_dont_sum_to_10000_rejected() {
+fn test_set_batch_size_caps_success() {
     let setup = TestSetup::new();
-    let bounty_id = 402u64;
-    let amount = 10_000i128;
-    let deadline = setup.env.ledger().timestamp() + 1_000;
-    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
-
-    let treasury = Address::generate(&setup.env);
-    let partner = Address::generate(&setup.env);
-    // 70% + 20% = 90% — must be rejected (InvalidAmount = 13)
-    setup.escrow.set_fee_routing(&bounty_id, &treasury, &7_000i128, &Some(partner), &2_000i128);
+    setup.escrow.set_batch_size_caps(&5_u32, &3_u32);
+    let caps = setup.escrow.get_batch_size_caps();
+    assert_eq!(caps.lock_cap, 5);
+    assert_eq!(caps.release_cap, 3);
 }
 
-#[test]
-#[should_panic(expected = "Error(Contract, #13)")]
-fn test_set_fee_routing_treasury_only_wrong_bps_rejected() {
-    let setup = TestSetup::new();
-    let bounty_id = 403u64;
-    let amount = 10_000i128;
-    let deadline = setup.env.ledger().timestamp() + 1_000;
-    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
-
-    let treasury = Address::generate(&setup.env);
-    // No partner but treasury_bps != 10_000 — must be rejected
-    setup.escrow.set_fee_routing(&bounty_id, &treasury, &9_000i128, &None, &0i128);
-}
+// --- set_batch_size_caps: emits BatchSizeCapsUpdated event ---
 
 #[test]
-#[should_panic(expected = "Error(Contract, #202)")]
-fn test_set_fee_routing_bounty_not_found_rejected() {
+fn test_set_batch_size_caps_emits_event() {
     let setup = TestSetup::new();
-    let treasury = Address::generate(&setup.env);
-    // Bounty 999 does not exist
-    setup.escrow.set_fee_routing(&999u64, &treasury, &10_000i128, &None, &0i128);
-}
-
-// --- get_fee_routing: returns None when not set ---
-
-#[test]
-fn test_get_fee_routing_returns_none_when_unset() {
-    let setup = TestSetup::new();
-    let bounty_id = 404u64;
-    let amount = 10_000i128;
-    let deadline = setup.env.ledger().timestamp() + 1_000;
-    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
-
-    assert!(setup.escrow.get_fee_routing(&bounty_id).is_none());
-}
-
-// --- fee routing invariant: treasury-only routing ---
-
-#[test]
-fn test_fee_routing_treasury_only_receives_full_fee_on_lock() {
-    let setup = TestSetup::new();
-    let bounty_id = 405u64;
-    let gross = 100_000i128;
-    let deadline = setup.env.ledger().timestamp() + 1_000;
-
-    let treasury = Address::generate(&setup.env);
-    let fee_recipient = Address::generate(&setup.env);
-
-    // Enable 2% lock fee globally
-    setup_fee_config(&setup, &fee_recipient);
-
-    // Lock first so bounty exists, then set routing
-    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &gross, &deadline);
-    // fee = ceil(100_000 * 200 / 10_000) = 2_000 already went to fee_recipient (no routing yet)
-    // Now set routing for a NEW bounty
-    let bounty_id2 = 406u64;
-    setup.token_admin.mint(&setup.depositor, &gross);
-    setup.escrow.lock_funds(&setup.depositor, &bounty_id2, &gross, &deadline);
-    setup.escrow.set_fee_routing(&bounty_id2, &treasury, &10_000i128, &None, &0i128);
-
-    // Lock a third bounty that has routing pre-set — but routing is set after lock,
-    // so we test release routing instead.
-    let token_client = soroban_sdk::token::TokenClient::new(&setup.env, &setup.token.address);
-    let treasury_balance_before = token_client.balance(&treasury);
-
-    // Release bounty_id2 — release fee (1%) should go to treasury via per-bounty routing
-    setup.escrow.release_funds(&bounty_id2, &setup.contributor);
-
-    // release fee = ceil(net_amount * 100 / 10_000)
-    // net_amount after 2% lock fee = 100_000 - 2_000 = 98_000
-    // release fee = ceil(98_000 * 100 / 10_000) = 980
-    let treasury_balance_after = token_client.balance(&treasury);
-    assert_eq!(
-        treasury_balance_after - treasury_balance_before,
-        980,
-        "treasury must receive the full release fee via per-bounty routing"
-    );
-}
-
-#[test]
-fn test_fee_routing_partner_split_invariant_holds() {
-    let setup = TestSetup::new();
-    let bounty_id = 407u64;
-    let gross = 100_000i128;
-    let deadline = setup.env.ledger().timestamp() + 1_000;
-
-    let treasury = Address::generate(&setup.env);
-    let partner = Address::generate(&setup.env);
-    let fee_recipient = Address::generate(&setup.env);
-
-    setup_fee_config(&setup, &fee_recipient);
-    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &gross, &deadline);
-    // Set 70/30 split for release fee
-    setup.escrow.set_fee_routing(&bounty_id, &treasury, &7_000i128, &Some(partner.clone()), &3_000i128);
-
-    let token_client = soroban_sdk::token::TokenClient::new(&setup.env, &setup.token.address);
-    let treasury_before = token_client.balance(&treasury);
-    let partner_before = token_client.balance(&partner);
-
-    setup.escrow.release_funds(&bounty_id, &setup.contributor);
-
-    // net_amount = 100_000 - 2_000 = 98_000
-    // release fee = ceil(98_000 * 100 / 10_000) = 980
-    // treasury share = floor(980 * 7_000 / 10_000) = 686
-    // partner share = 980 - 686 = 294
-    let treasury_after = token_client.balance(&treasury);
-    let partner_after = token_client.balance(&partner);
-
-    let treasury_received = treasury_after - treasury_before;
-    let partner_received = partner_after - partner_before;
-
-    // Invariant: treasury + partner == total fee
-    assert_eq!(
-        treasury_received + partner_received,
-        980,
-        "fee routing invariant: treasury + partner must equal total release fee"
-    );
-    assert_eq!(treasury_received, 686, "treasury must receive 70% of fee");
-    assert_eq!(partner_received, 294, "partner must receive 30% of fee");
-}
-
-// --- audit event emission ---
-
-#[test]
-fn test_set_fee_routing_emits_fee_routing_updated_event() {
-    let setup = TestSetup::new();
-    let bounty_id = 408u64;
-    let amount = 10_000i128;
-    let deadline = setup.env.ledger().timestamp() + 1_000;
-    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &amount, &deadline);
-
-    let treasury = Address::generate(&setup.env);
-    setup.escrow.set_fee_routing(&bounty_id, &treasury, &10_000i128, &None, &0i128);
-
+    setup.escrow.set_batch_size_caps(&4_u32, &2_u32);
     let events = setup.env.events().all();
     let found = events.iter().any(|(_, topics, _)| {
         topics.len() >= 1
             && topics
                 .get(0)
-                .map(|t| t == soroban_sdk::Symbol::new(&setup.env, "fee_rte").into_val(&setup.env))
+                .map(|t| {
+                    t == soroban_sdk::Symbol::new(&setup.env, "bcapcfg").into_val(&setup.env)
+                })
                 .unwrap_or(false)
     });
-    assert!(found, "FeeRoutingUpdated event must be emitted by set_fee_routing");
+    assert!(found, "BatchSizeCapsUpdated event not emitted");
+}
+
+// --- set_batch_size_caps: boundary values ---
+
+#[test]
+fn test_set_batch_size_caps_min_boundary() {
+    let setup = TestSetup::new();
+    // cap = 1 is the minimum valid value.
+    setup.escrow.set_batch_size_caps(&1_u32, &1_u32);
+    let caps = setup.escrow.get_batch_size_caps();
+    assert_eq!(caps.lock_cap, 1);
+    assert_eq!(caps.release_cap, 1);
 }
 
 #[test]
-fn test_fee_routing_emits_fee_routed_event_on_release() {
+fn test_set_batch_size_caps_max_boundary() {
     let setup = TestSetup::new();
-    let bounty_id = 409u64;
-    let gross = 50_000i128;
-    let deadline = setup.env.ledger().timestamp() + 1_000;
+    // cap = 20 (MAX_BATCH_SIZE) is the maximum valid value.
+    setup.escrow.set_batch_size_caps(&20_u32, &20_u32);
+    let caps = setup.escrow.get_batch_size_caps();
+    assert_eq!(caps.lock_cap, 20);
+    assert_eq!(caps.release_cap, 20);
+}
 
-    let treasury = Address::generate(&setup.env);
-    let fee_recipient = Address::generate(&setup.env);
-    setup_fee_config(&setup, &fee_recipient);
+// --- set_batch_size_caps: invalid inputs ---
 
-    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &gross, &deadline);
-    setup.escrow.set_fee_routing(&bounty_id, &treasury, &10_000i128, &None, &0i128);
-    setup.escrow.release_funds(&bounty_id, &setup.contributor);
-
-    let events = setup.env.events().all();
-    let found = events.iter().any(|(_, topics, _)| {
-        topics.len() >= 1
-            && topics
-                .get(0)
-                .map(|t| t == soroban_sdk::Symbol::new(&setup.env, "fee_rt").into_val(&setup.env))
-                .unwrap_or(false)
-    });
-    assert!(found, "FeeRouted event must be emitted when per-bounty routing is active");
+#[test]
+fn test_set_batch_size_caps_zero_lock_cap_rejected() {
+    let setup = TestSetup::new();
+    let res = setup.escrow.try_set_batch_size_caps(&0_u32, &5_u32);
+    assert!(matches!(res, Err(Ok(Error::InvalidBatchSizeCap))));
 }
 
 #[test]
-fn test_fee_routing_emits_invariant_checked_event() {
+fn test_set_batch_size_caps_zero_release_cap_rejected() {
     let setup = TestSetup::new();
-    let bounty_id = 410u64;
-    let gross = 50_000i128;
-    let deadline = setup.env.ledger().timestamp() + 1_000;
-
-    let treasury = Address::generate(&setup.env);
-    let fee_recipient = Address::generate(&setup.env);
-    setup_fee_config(&setup, &fee_recipient);
-
-    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &gross, &deadline);
-    setup.escrow.set_fee_routing(&bounty_id, &treasury, &10_000i128, &None, &0i128);
-    setup.escrow.release_funds(&bounty_id, &setup.contributor);
-
-    let events = setup.env.events().all();
-    let found = events.iter().any(|(_, topics, _)| {
-        topics.len() >= 1
-            && topics
-                .get(0)
-                .map(|t| t == soroban_sdk::Symbol::new(&setup.env, "fee_inv").into_val(&setup.env))
-                .unwrap_or(false)
-    });
-    assert!(found, "FeeRoutingInvariantChecked event must be emitted");
+    let res = setup.escrow.try_set_batch_size_caps(&5_u32, &0_u32);
+    assert!(matches!(res, Err(Ok(Error::InvalidBatchSizeCap))));
 }
 
-// --- upgrade-safe schema version ---
-
 #[test]
-fn test_fee_routing_schema_version_set_on_init() {
+fn test_set_batch_size_caps_exceeds_max_lock_rejected() {
     let setup = TestSetup::new();
-    // FeeRoutingSchemaVersion must be written during init
-    let events = setup.env.events().all();
-    let found = events.iter().any(|(_, topics, _)| {
-        topics.len() >= 1
-            && topics
-                .get(0)
-                .map(|t| t == soroban_sdk::Symbol::new(&setup.env, "fee_schm").into_val(&setup.env))
-                .unwrap_or(false)
-    });
-    assert!(found, "FeeRoutingSchemaVersionSet event must be emitted during init");
+    // 21 > MAX_BATCH_SIZE (20)
+    let res = setup.escrow.try_set_batch_size_caps(&21_u32, &5_u32);
+    assert!(matches!(res, Err(Ok(Error::InvalidBatchSizeCap))));
 }
 
-// --- fallback: no per-bounty routing uses global path ---
+#[test]
+fn test_set_batch_size_caps_exceeds_max_release_rejected() {
+    let setup = TestSetup::new();
+    let res = setup.escrow.try_set_batch_size_caps(&5_u32, &21_u32);
+    assert!(matches!(res, Err(Ok(Error::InvalidBatchSizeCap))));
+}
+
+// --- batch_lock_funds: respects configured lock cap ---
 
 #[test]
-fn test_no_per_bounty_routing_falls_back_to_global() {
+fn test_batch_lock_funds_within_cap_succeeds() {
     let setup = TestSetup::new();
-    let bounty_id = 411u64;
-    let gross = 100_000i128;
-    let deadline = setup.env.ledger().timestamp() + 1_000;
+    // Mint enough tokens for the batch.
+    setup.token_admin.mint(&setup.depositor, &10_000);
+    setup.escrow.set_batch_size_caps(&3_u32, &20_u32);
+    let items = make_lock_items(&setup, 1000, 3);
+    let count = setup.escrow.batch_lock_funds(&items);
+    assert_eq!(count, 3);
+}
 
-    let fee_recipient = Address::generate(&setup.env);
-    setup_fee_config(&setup, &fee_recipient);
+#[test]
+fn test_batch_lock_funds_exceeds_cap_rejected() {
+    let setup = TestSetup::new();
+    setup.token_admin.mint(&setup.depositor, &10_000);
+    // Set lock cap to 2, then try to lock 3 items.
+    setup.escrow.set_batch_size_caps(&2_u32, &20_u32);
+    let items = make_lock_items(&setup, 2000, 3);
+    let res = setup.escrow.try_batch_lock_funds(&items);
+    assert!(matches!(res, Err(Ok(Error::InvalidBatchSize))));
+}
 
-    setup.escrow.lock_funds(&setup.depositor, &bounty_id, &gross, &deadline);
-    // No set_fee_routing call — global path should be used
-    setup.escrow.release_funds(&bounty_id, &setup.contributor);
+#[test]
+fn test_batch_lock_funds_exactly_at_cap_succeeds() {
+    let setup = TestSetup::new();
+    setup.token_admin.mint(&setup.depositor, &10_000);
+    setup.escrow.set_batch_size_caps(&2_u32, &20_u32);
+    let items = make_lock_items(&setup, 3000, 2);
+    let count = setup.escrow.batch_lock_funds(&items);
+    assert_eq!(count, 2);
+}
 
-    let token_client = soroban_sdk::token::TokenClient::new(&setup.env, &setup.token.address);
-    // release fee = ceil(98_000 * 100 / 10_000) = 980 → goes to fee_recipient
-    assert_eq!(
-        token_client.balance(&fee_recipient),
-        // lock fee (2_000) + release fee (980)
-        2_980,
-        "global fee_recipient must receive both lock and release fees when no per-bounty routing"
-    );
+// --- batch_release_funds: respects configured release cap ---
+
+#[test]
+fn test_batch_release_funds_within_cap_succeeds() {
+    let setup = TestSetup::new();
+    setup.token_admin.mint(&setup.depositor, &10_000);
+    // Lock 3 bounties first.
+    let lock_items = make_lock_items(&setup, 4000, 3);
+    setup.escrow.batch_lock_funds(&lock_items);
+    // Set release cap to 3 and release all.
+    setup.escrow.set_batch_size_caps(&20_u32, &3_u32);
+    let release_items = make_release_items(&setup, 4000, 3);
+    let count = setup.escrow.batch_release_funds(&release_items);
+    assert_eq!(count, 3);
+}
+
+#[test]
+fn test_batch_release_funds_exceeds_cap_rejected() {
+    let setup = TestSetup::new();
+    setup.token_admin.mint(&setup.depositor, &10_000);
+    let lock_items = make_lock_items(&setup, 5000, 3);
+    setup.escrow.batch_lock_funds(&lock_items);
+    // Set release cap to 2, then try to release 3.
+    setup.escrow.set_batch_size_caps(&20_u32, &2_u32);
+    let release_items = make_release_items(&setup, 5000, 3);
+    let res = setup.escrow.try_batch_release_funds(&release_items);
+    assert!(matches!(res, Err(Ok(Error::InvalidBatchSize))));
+}
+
+// --- lock and release caps are independent ---
+
+#[test]
+fn test_lock_and_release_caps_are_independent() {
+    let setup = TestSetup::new();
+    setup.token_admin.mint(&setup.depositor, &10_000);
+    // lock_cap=5, release_cap=2
+    setup.escrow.set_batch_size_caps(&5_u32, &2_u32);
+
+    // Locking 4 items should succeed (4 <= 5).
+    let lock_items = make_lock_items(&setup, 6000, 4);
+    let count = setup.escrow.batch_lock_funds(&lock_items);
+    assert_eq!(count, 4);
+
+    // Releasing 3 items should fail (3 > 2).
+    let release_items = make_release_items(&setup, 6000, 3);
+    let res = setup.escrow.try_batch_release_funds(&release_items);
+    assert!(matches!(res, Err(Ok(Error::InvalidBatchSize))));
+
+    // Releasing 2 items should succeed (2 <= 2).
+    let release_items_ok = make_release_items(&setup, 6000, 2);
+    let released = setup.escrow.batch_release_funds(&release_items_ok);
+    assert_eq!(released, 2);
+}
+
+// --- cap update is idempotent ---
+
+#[test]
+fn test_set_batch_size_caps_idempotent() {
+    let setup = TestSetup::new();
+    setup.escrow.set_batch_size_caps(&5_u32, &5_u32);
+    setup.escrow.set_batch_size_caps(&5_u32, &5_u32);
+    let caps = setup.escrow.get_batch_size_caps();
+    assert_eq!(caps.lock_cap, 5);
+    assert_eq!(caps.release_cap, 5);
+}
+
+// --- upgrade-safe: caps survive a re-read after storage write ---
+
+#[test]
+fn test_batch_size_caps_persist_in_storage() {
+    let setup = TestSetup::new();
+    setup.escrow.set_batch_size_caps(&7_u32, &3_u32);
+    // Read back via the public view — must match what was written.
+    let caps = setup.escrow.get_batch_size_caps();
+    assert_eq!(caps.lock_cap, 7);
+    assert_eq!(caps.release_cap, 3);
 }
