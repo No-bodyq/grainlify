@@ -366,6 +366,9 @@ enum DataKey {
     UpgradeTimelock(u64),
     /// [FIX-C02] Pending admin restore awaiting new-admin confirmation
     PendingAdminRestore,
+    /// Upgrade-safe schema version marker for liveness watchdog storage.
+    /// Written on init_admin; increment when LivenessStatus layout changes.
+    LivenessSchemaVersion,
 }
 
 // ============================================================================
@@ -1296,6 +1299,53 @@ impl GrainlifyContract {
 
     pub fn is_paused(env: Env) -> bool {
         MultiSig::is_contract_paused(&env)
+    }
+
+    /// Unified liveness watchdog view.
+    ///
+    /// Returns a single `LivenessStatus` snapshot combining pause state,
+    /// read-only mode, version, and admin presence. Designed for polling by
+    /// monitoring agents, circuit breakers, and dashboards.
+    ///
+    /// # No Authorization Required
+    /// This is a pure read — no auth, no state mutation.
+    ///
+    /// # Upgrade Safety
+    /// `schema_version` reflects the `LivenessSchemaVersion` written at init.
+    /// Returns `0` on legacy deployments where the marker was never written.
+    pub fn liveness_watchdog(env: Env) -> LivenessStatus {
+        let is_paused = MultiSig::is_contract_paused(&env);
+        let is_read_only: bool = env
+            .storage()
+            .instance()
+            .get(&DataKey::ReadOnlyMode)
+            .unwrap_or(false);
+        LivenessStatus {
+            is_paused,
+            is_read_only,
+            is_operational: !is_paused && !is_read_only,
+            version: env
+                .storage()
+                .instance()
+                .get(&DataKey::Version)
+                .unwrap_or(0),
+            admin_set: env.storage().instance().has(&DataKey::Admin),
+            timestamp: env.ledger().timestamp(),
+            schema_version: env
+                .storage()
+                .instance()
+                .get(&DataKey::LivenessSchemaVersion)
+                .unwrap_or(0),
+        }
+    }
+
+    /// Returns the liveness schema version written at init.
+    /// Returns `0` on legacy deployments where the marker was never written.
+    pub fn get_liveness_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::LivenessSchemaVersion)
+            .unwrap_or(0)
     }
 
     pub fn can_execute(env: Env, proposal_id: u64) -> bool {

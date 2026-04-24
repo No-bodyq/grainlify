@@ -75,7 +75,7 @@
         },
         "view": {
           "type": "array",
-          "description": "Read-only functions that don't require authentication",
+          "description": "Read-only functions that don't require authentication. Includes liveness/health views such as liveness_watchdog() which returns a LivenessStatus snapshot combining pause state, read-only mode, version, and admin presence.",
           "items": {
             "$ref": "#/$defs/entrypoint"
           }
@@ -281,7 +281,8 @@
       "properties": {
         "name": {
           "type": "string",
-          "description": "Function name"
+          "description": "Function name",
+          "examples": ["init_program", "batch_payout", "liveness_watchdog", "get_liveness_schema_version"]
         },
         "description": {
           "type": "string",
@@ -300,7 +301,8 @@
           "properties": {
             "type": {
               "type": "string",
-              "description": "Return type"
+              "description": "Return type",
+              "examples": ["ProgramData", "bool", "u32", "LivenessStatus", "Option<Address>"]
             },
             "description": {
               "type": "string",
