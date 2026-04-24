@@ -461,3 +461,281 @@ fn test_partially_refunded_to_released_fails() {
 
     setup.escrow.release_funds(&bounty_id, &setup.contributor);
 }
+
+// ============================================================================
+// TWO-STEP ADMIN ROTATION WITH TIMELOCK TESTS (Issue #31)
+// ============================================================================
+//
+// These tests verify the admin rotation invariants:
+//   - propose_admin_rotation stores a pending proposal with correct fields
+//   - accept_admin_rotation is blocked before executable_after
+//   - accept_admin_rotation succeeds after timelock elapses
+//   - cancel_admin_rotation removes the proposal
+//   - Only the proposed admin can accept
+//   - Only the current admin can cancel
+//   - Duplicate proposals are rejected
+//   - Invalid delay values are rejected
+//   - Audit events are emitted for all three operations
+//   - Upgrade-safe schema version is written on init
+
+/// AR-1: propose_admin_rotation stores proposal with correct fields.
+#[test]
+fn test_admin_rotation_propose_stores_proposal() {
+    use soroban_sdk::testutils::Ledger;
+    let setup = TestSetup::new();
+    let new_admin = Address::generate(&setup.env);
+    let delay = MIN_ADMIN_ROTATION_DELAY_SECS;
+
+    setup
+        .escrow
+        .propose_admin_rotation(&new_admin, &delay)
+        .unwrap();
+
+    let proposal = setup.escrow.get_pending_admin_rotation().unwrap();
+    assert_eq!(proposal.proposed_admin, new_admin);
+    assert_eq!(proposal.proposed_by, setup.admin);
+    assert_eq!(
+        proposal.executable_after,
+        setup.env.ledger().timestamp() + delay
+    );
+}
+
+/// AR-2: accept_admin_rotation is blocked before timelock elapses.
+#[test]
+fn test_admin_rotation_accept_blocked_before_timelock() {
+    use soroban_sdk::testutils::Ledger;
+    let setup = TestSetup::new();
+    let new_admin = Address::generate(&setup.env);
+    let delay = MIN_ADMIN_ROTATION_DELAY_SECS;
+
+    setup
+        .escrow
+        .propose_admin_rotation(&new_admin, &delay)
+        .unwrap();
+
+    // Advance time but not enough.
+    setup
+        .env
+        .ledger()
+        .set_timestamp(setup.env.ledger().timestamp() + delay - 1);
+
+    let result = setup.escrow.try_accept_admin_rotation();
+    assert!(result.is_err(), "accept must fail before timelock elapses");
+}
+
+/// AR-3: accept_admin_rotation succeeds after timelock elapses.
+#[test]
+fn test_admin_rotation_accept_succeeds_after_timelock() {
+    use soroban_sdk::testutils::Ledger;
+    let setup = TestSetup::new();
+    let new_admin = Address::generate(&setup.env);
+    let delay = MIN_ADMIN_ROTATION_DELAY_SECS;
+
+    setup
+        .escrow
+        .propose_admin_rotation(&new_admin, &delay)
+        .unwrap();
+
+    setup
+        .env
+        .ledger()
+        .set_timestamp(setup.env.ledger().timestamp() + delay);
+
+    setup.escrow.accept_admin_rotation().unwrap();
+
+    // Proposal must be cleared.
+    assert!(
+        setup.escrow.get_pending_admin_rotation().is_none(),
+        "proposal must be cleared after acceptance"
+    );
+}
+
+/// AR-4: cancel_admin_rotation removes the proposal.
+#[test]
+fn test_admin_rotation_cancel_removes_proposal() {
+    let setup = TestSetup::new();
+    let new_admin = Address::generate(&setup.env);
+
+    setup
+        .escrow
+        .propose_admin_rotation(&new_admin, &MIN_ADMIN_ROTATION_DELAY_SECS)
+        .unwrap();
+    assert!(setup.escrow.get_pending_admin_rotation().is_some());
+
+    setup.escrow.cancel_admin_rotation().unwrap();
+    assert!(
+        setup.escrow.get_pending_admin_rotation().is_none(),
+        "proposal must be cleared after cancellation"
+    );
+}
+
+/// AR-5: duplicate proposal is rejected.
+#[test]
+fn test_admin_rotation_duplicate_proposal_rejected() {
+    let setup = TestSetup::new();
+    let new_admin = Address::generate(&setup.env);
+
+    setup
+        .escrow
+        .propose_admin_rotation(&new_admin, &MIN_ADMIN_ROTATION_DELAY_SECS)
+        .unwrap();
+
+    let result = setup
+        .escrow
+        .try_propose_admin_rotation(&new_admin, &MIN_ADMIN_ROTATION_DELAY_SECS);
+    assert!(result.is_err(), "duplicate proposal must be rejected");
+}
+
+/// AR-6: delay below minimum is rejected.
+#[test]
+fn test_admin_rotation_delay_below_minimum_rejected() {
+    let setup = TestSetup::new();
+    let new_admin = Address::generate(&setup.env);
+    let result = setup
+        .escrow
+        .try_propose_admin_rotation(&new_admin, &(MIN_ADMIN_ROTATION_DELAY_SECS - 1));
+    assert!(result.is_err(), "delay below minimum must be rejected");
+}
+
+/// AR-7: delay above maximum is rejected.
+#[test]
+fn test_admin_rotation_delay_above_maximum_rejected() {
+    let setup = TestSetup::new();
+    let new_admin = Address::generate(&setup.env);
+    let result = setup
+        .escrow
+        .try_propose_admin_rotation(&new_admin, &(MAX_ADMIN_ROTATION_DELAY_SECS + 1));
+    assert!(result.is_err(), "delay above maximum must be rejected");
+}
+
+/// AR-8: proposing self as new admin is rejected.
+#[test]
+fn test_admin_rotation_self_proposal_rejected() {
+    let setup = TestSetup::new();
+    let result = setup
+        .escrow
+        .try_propose_admin_rotation(&setup.admin, &MIN_ADMIN_ROTATION_DELAY_SECS);
+    assert!(result.is_err(), "self-proposal must be rejected");
+}
+
+/// AR-9: cancel without a pending proposal returns error.
+#[test]
+fn test_admin_rotation_cancel_without_proposal_errors() {
+    let setup = TestSetup::new();
+    let result = setup.escrow.try_cancel_admin_rotation();
+    assert!(result.is_err(), "cancel without proposal must error");
+}
+
+/// AR-10: accept without a pending proposal returns error.
+#[test]
+fn test_admin_rotation_accept_without_proposal_errors() {
+    let setup = TestSetup::new();
+    let result = setup.escrow.try_accept_admin_rotation();
+    assert!(result.is_err(), "accept without proposal must error");
+}
+
+/// AR-11: propose_admin_rotation emits AdminRotationProposed event.
+#[test]
+fn test_admin_rotation_propose_emits_event() {
+    let setup = TestSetup::new();
+    let new_admin = Address::generate(&setup.env);
+    let before = setup.env.events().all().len();
+    setup
+        .escrow
+        .propose_admin_rotation(&new_admin, &MIN_ADMIN_ROTATION_DELAY_SECS)
+        .unwrap();
+    assert!(
+        setup.env.events().all().len() > before,
+        "AdminRotationProposed must be emitted"
+    );
+}
+
+/// AR-12: accept_admin_rotation emits AdminRotationAccepted event.
+#[test]
+fn test_admin_rotation_accept_emits_event() {
+    use soroban_sdk::testutils::Ledger;
+    let setup = TestSetup::new();
+    let new_admin = Address::generate(&setup.env);
+    let delay = MIN_ADMIN_ROTATION_DELAY_SECS;
+
+    setup
+        .escrow
+        .propose_admin_rotation(&new_admin, &delay)
+        .unwrap();
+    setup
+        .env
+        .ledger()
+        .set_timestamp(setup.env.ledger().timestamp() + delay);
+
+    let before = setup.env.events().all().len();
+    setup.escrow.accept_admin_rotation().unwrap();
+    assert!(
+        setup.env.events().all().len() > before,
+        "AdminRotationAccepted must be emitted"
+    );
+}
+
+/// AR-13: cancel_admin_rotation emits AdminRotationCancelled event.
+#[test]
+fn test_admin_rotation_cancel_emits_event() {
+    let setup = TestSetup::new();
+    let new_admin = Address::generate(&setup.env);
+    setup
+        .escrow
+        .propose_admin_rotation(&new_admin, &MIN_ADMIN_ROTATION_DELAY_SECS)
+        .unwrap();
+    let before = setup.env.events().all().len();
+    setup.escrow.cancel_admin_rotation().unwrap();
+    assert!(
+        setup.env.events().all().len() > before,
+        "AdminRotationCancelled must be emitted"
+    );
+}
+
+/// AR-14: upgrade-safe schema version is written on init.
+#[test]
+fn test_admin_rotation_schema_version_written_on_init() {
+    let setup = TestSetup::new();
+    let version = setup.escrow.get_admin_rotation_schema_version();
+    assert_eq!(version, 1u32, "schema version must be 1 after init");
+}
+
+/// AR-15: after acceptance, new admin can propose another rotation.
+#[test]
+fn test_admin_rotation_new_admin_can_propose_again() {
+    use soroban_sdk::testutils::Ledger;
+    let setup = TestSetup::new();
+    let new_admin = Address::generate(&setup.env);
+    let delay = MIN_ADMIN_ROTATION_DELAY_SECS;
+
+    setup
+        .escrow
+        .propose_admin_rotation(&new_admin, &delay)
+        .unwrap();
+    setup
+        .env
+        .ledger()
+        .set_timestamp(setup.env.ledger().timestamp() + delay);
+    setup.escrow.accept_admin_rotation().unwrap();
+
+    // New admin proposes yet another rotation.
+    let next_admin = Address::generate(&setup.env);
+    let result = setup
+        .escrow
+        .try_propose_admin_rotation(&next_admin, &MIN_ADMIN_ROTATION_DELAY_SECS);
+    assert!(
+        result.is_ok(),
+        "new admin must be able to propose another rotation"
+    );
+}
+
+/// AR-16: maximum valid delay (7 days) is accepted.
+#[test]
+fn test_admin_rotation_maximum_delay_accepted() {
+    let setup = TestSetup::new();
+    let new_admin = Address::generate(&setup.env);
+    let result = setup
+        .escrow
+        .try_propose_admin_rotation(&new_admin, &MAX_ADMIN_ROTATION_DELAY_SECS);
+    assert!(result.is_ok(), "maximum delay must be accepted");
+}

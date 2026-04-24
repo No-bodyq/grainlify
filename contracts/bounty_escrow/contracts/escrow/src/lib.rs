@@ -617,6 +617,14 @@ pub enum Error {
     EscrowFrozen = 45,
     /// Returned when the escrow depositor is explicitly frozen by an admin hold.
     AddressFrozen = 46,
+    /// Returned when no pending admin rotation proposal exists.
+    NoPendingAdminRotation = 47,
+    /// Returned when the timelock delay has not yet elapsed.
+    AdminRotationTimelockActive = 48,
+    /// Returned when a pending admin rotation already exists.
+    AdminRotationAlreadyPending = 49,
+    /// Returned when the rotation delay is outside the allowed range.
+    InvalidAdminRotationDelay = 50,
 }
 
 /// Bit flag: escrow or payout should be treated as elevated risk (indexers, UIs).
@@ -776,6 +784,23 @@ pub struct FreezeRecord {
     pub frozen_by: Address,
 }
 
+/// Pending two-step admin rotation proposal.
+///
+/// Created by `propose_admin_rotation`; consumed by `accept_admin_rotation`.
+/// Cancelled by `cancel_admin_rotation` (current admin only).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminRotation {
+    /// The proposed new admin address.
+    pub proposed_admin: Address,
+    /// Ledger timestamp when the proposal was created.
+    pub proposed_at: u64,
+    /// Earliest ledger timestamp at which `accept_admin_rotation` may be called.
+    pub executable_after: u64,
+    /// Current admin that created the proposal.
+    pub proposed_by: Address,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
@@ -832,6 +857,10 @@ pub enum DataKey {
     CycleLink(u64),
     /// Stored schema marker for refund-eligibility view semantics.
     RefundEligibilitySchemaVersion,
+    /// Pending admin rotation proposal (two-step rotation).
+    PendingAdminRotation,
+    /// Upgrade-safe schema version marker for admin-rotation storage layout.
+    AdminRotationSchemaVersion,
 }
 
 #[contracttype]
@@ -960,6 +989,19 @@ pub struct ReleaseApproval {
 }
 
 const REFUND_ELIGIBILITY_SCHEMA_VERSION_V1: u32 = 1;
+
+/// Current admin-rotation storage schema version.
+///
+/// Increment whenever `PendingAdminRotation` layout changes in a breaking way.
+/// Written to instance storage during `init` so upgrade safety checks can
+/// detect schema mismatches on legacy deployments.
+const ADMIN_ROTATION_SCHEMA_VERSION_V1: u32 = 1;
+
+/// Minimum timelock delay for admin rotation: 1 hour.
+pub const MIN_ADMIN_ROTATION_DELAY_SECS: u64 = 3_600;
+
+/// Maximum timelock delay for admin rotation: 7 days.
+pub const MAX_ADMIN_ROTATION_DELAY_SECS: u64 = 7 * 24 * 3_600; // 604_800
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -1184,6 +1226,11 @@ impl BountyEscrowContract {
             &DataKey::RefundEligibilitySchemaVersion,
             &REFUND_ELIGIBILITY_SCHEMA_VERSION_V1,
         );
+        // Write upgrade-safe admin-rotation schema version marker.
+        env.storage().instance().set(
+            &DataKey::AdminRotationSchemaVersion,
+            &ADMIN_ROTATION_SCHEMA_VERSION_V1,
+        );
 
         events::emit_bounty_initialized(
             &env,
@@ -1229,6 +1276,191 @@ impl BountyEscrowContract {
     /// Return the persisted contract version.
     pub fn get_version(env: Env) -> u32 {
         env.storage().instance().get(&DataKey::Version).unwrap_or(0)
+    }
+
+    // =========================================================================
+    // TWO-STEP ADMIN ROTATION WITH TIMELOCK
+    // =========================================================================
+
+    /// Step 1 of two-step admin rotation: propose a new admin with a timelock.
+    ///
+    /// The current admin proposes `new_admin` as the replacement. The proposal
+    /// is stored on-chain and becomes executable only after `delay_secs` seconds
+    /// have elapsed. The proposed admin must then call `accept_admin_rotation`
+    /// to complete the transfer.
+    ///
+    /// # Validation
+    /// - `delay_secs` must be in `[MIN_ADMIN_ROTATION_DELAY_SECS, MAX_ADMIN_ROTATION_DELAY_SECS]`
+    ///   (1 hour – 7 days).
+    /// - Only one pending proposal may exist at a time; a second call returns
+    ///   `AdminRotationAlreadyPending`.
+    /// - `new_admin` must differ from the current admin.
+    ///
+    /// # Audit event
+    /// Emits `AdminRotationProposed` after the proposal is persisted (CEI).
+    pub fn propose_admin_rotation(
+        env: Env,
+        new_admin: Address,
+        delay_secs: u64,
+    ) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let current_admin: Address =
+            env.storage().instance().get(&DataKey::Admin).unwrap();
+        current_admin.require_auth();
+
+        if new_admin == current_admin {
+            return Err(Error::Unauthorized);
+        }
+
+        if delay_secs < MIN_ADMIN_ROTATION_DELAY_SECS
+            || delay_secs > MAX_ADMIN_ROTATION_DELAY_SECS
+        {
+            return Err(Error::InvalidAdminRotationDelay);
+        }
+
+        if env
+            .storage()
+            .instance()
+            .has(&DataKey::PendingAdminRotation)
+        {
+            return Err(Error::AdminRotationAlreadyPending);
+        }
+
+        let now = env.ledger().timestamp();
+        let proposal = PendingAdminRotation {
+            proposed_admin: new_admin.clone(),
+            proposed_at: now,
+            executable_after: now.saturating_add(delay_secs),
+            proposed_by: current_admin.clone(),
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::PendingAdminRotation, &proposal);
+
+        // Emit audit event after storage write (CEI ordering).
+        events::emit_admin_rotation_proposed(
+            &env,
+            events::AdminRotationProposed {
+                version: EVENT_VERSION_V2,
+                current_admin,
+                proposed_admin: new_admin,
+                proposed_at: now,
+                executable_after: proposal.executable_after,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Step 2 of two-step admin rotation: the proposed admin accepts and
+    /// becomes the new admin.
+    ///
+    /// May only be called by the address stored in the pending proposal, and
+    /// only after `executable_after` has passed.
+    ///
+    /// # Audit event
+    /// Emits `AdminRotationAccepted` after the admin key is updated (CEI).
+    pub fn accept_admin_rotation(env: Env) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+
+        let proposal: PendingAdminRotation = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdminRotation)
+            .ok_or(Error::NoPendingAdminRotation)?;
+
+        // Only the proposed admin may accept.
+        proposal.proposed_admin.require_auth();
+
+        let now = env.ledger().timestamp();
+        if now < proposal.executable_after {
+            return Err(Error::AdminRotationTimelockActive);
+        }
+
+        let old_admin = proposal.proposed_by.clone();
+        let new_admin = proposal.proposed_admin.clone();
+
+        // EFFECTS: update admin key and remove proposal atomically.
+        env.storage()
+            .instance()
+            .set(&DataKey::Admin, &new_admin);
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdminRotation);
+
+        // Emit audit event after state update (CEI ordering).
+        events::emit_admin_rotation_accepted(
+            &env,
+            events::AdminRotationAccepted {
+                version: EVENT_VERSION_V2,
+                old_admin,
+                new_admin,
+                accepted_at: now,
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Cancel a pending admin rotation proposal (current admin only).
+    ///
+    /// The current admin may cancel at any time before the proposed admin
+    /// accepts. This is the safety valve if the wrong address was proposed
+    /// or the rotation needs to be aborted.
+    ///
+    /// # Audit event
+    /// Emits `AdminRotationCancelled` after the proposal is removed (CEI).
+    pub fn cancel_admin_rotation(env: Env) -> Result<(), Error> {
+        if !env.storage().instance().has(&DataKey::Admin) {
+            return Err(Error::NotInitialized);
+        }
+        let current_admin: Address =
+            env.storage().instance().get(&DataKey::Admin).unwrap();
+        current_admin.require_auth();
+
+        let proposal: PendingAdminRotation = env
+            .storage()
+            .instance()
+            .get(&DataKey::PendingAdminRotation)
+            .ok_or(Error::NoPendingAdminRotation)?;
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::PendingAdminRotation);
+
+        // Emit audit event after removal (CEI ordering).
+        events::emit_admin_rotation_cancelled(
+            &env,
+            events::AdminRotationCancelled {
+                version: EVENT_VERSION_V2,
+                cancelled_by: current_admin,
+                proposed_admin: proposal.proposed_admin,
+                cancelled_at: env.ledger().timestamp(),
+            },
+        );
+
+        Ok(())
+    }
+
+    /// Return the pending admin rotation proposal, if one exists.
+    pub fn get_pending_admin_rotation(env: Env) -> Option<PendingAdminRotation> {
+        env.storage()
+            .instance()
+            .get(&DataKey::PendingAdminRotation)
+    }
+
+    /// Return the admin-rotation storage schema version written during `init`.
+    /// Returns `0` on legacy deployments where the marker was never written.
+    pub fn get_admin_rotation_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::AdminRotationSchemaVersion)
+            .unwrap_or(0u32)
     }
 
     /// Update the persisted contract version (admin only).

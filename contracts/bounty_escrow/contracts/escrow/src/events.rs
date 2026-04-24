@@ -1409,3 +1409,105 @@ pub fn emit_recurring_lock_cancelled(env: &Env, event: RecurringLockCancelled) {
     let topics = (symbol_short!("rl_cncl"), event.recurring_id);
     env.events().publish(topics, event);
 }
+
+// ═══════════════════════════════════════════════════════════════════════════════
+// ADMIN ROTATION EVENTS
+// ═══════════════════════════════════════════════════════════════════════════════
+
+/// Payload for the [`emit_admin_rotation_proposed`] event.
+///
+/// Emitted when the current admin proposes a new admin via
+/// [`BountyEscrowContract::propose_admin_rotation`].
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"adm_prop"` |
+///
+/// ### Security notes
+/// - Only the current admin can propose a rotation (`require_auth` enforced).
+/// - `executable_after` is the earliest timestamp at which the proposed admin
+///   may call `accept_admin_rotation`. The timelock prevents instant takeovers.
+/// - Emitted **after** the proposal is persisted (CEI ordering).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRotationProposed {
+    pub version: u32,
+    /// Current admin that created the proposal.
+    pub current_admin: Address,
+    /// Proposed new admin address.
+    pub proposed_admin: Address,
+    /// Ledger timestamp when the proposal was created.
+    pub proposed_at: u64,
+    /// Earliest ledger timestamp at which the rotation may be accepted.
+    pub executable_after: u64,
+}
+
+/// Emit [`AdminRotationProposed`].
+pub fn emit_admin_rotation_proposed(env: &Env, event: AdminRotationProposed) {
+    let topics = (symbol_short!("adm_prop"),);
+    env.events().publish(topics, event);
+}
+
+/// Payload for the [`emit_admin_rotation_accepted`] event.
+///
+/// Emitted when the proposed admin accepts and becomes the new admin via
+/// [`BountyEscrowContract::accept_admin_rotation`].
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"adm_acc"` |
+///
+/// ### Security notes
+/// - Only the proposed admin can accept (`require_auth` enforced).
+/// - Emitted **after** the admin key is updated and the proposal is removed.
+/// - `old_admin` is preserved in the event for audit trail continuity.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRotationAccepted {
+    pub version: u32,
+    /// Previous admin address (now replaced).
+    pub old_admin: Address,
+    /// New admin address (now active).
+    pub new_admin: Address,
+    /// Ledger timestamp of acceptance.
+    pub accepted_at: u64,
+}
+
+/// Emit [`AdminRotationAccepted`].
+pub fn emit_admin_rotation_accepted(env: &Env, event: AdminRotationAccepted) {
+    let topics = (symbol_short!("adm_acc"),);
+    env.events().publish(topics, event);
+}
+
+/// Payload for the [`emit_admin_rotation_cancelled`] event.
+///
+/// Emitted when the current admin cancels a pending rotation proposal via
+/// [`BountyEscrowContract::cancel_admin_rotation`].
+///
+/// ### Topics
+/// | Index | Value |
+/// |-------|-------|
+/// | 0 | `"adm_can"` |
+///
+/// ### Security notes
+/// - Only the current admin can cancel (`require_auth` enforced).
+/// - Emitted **after** the proposal is removed from storage (CEI ordering).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct AdminRotationCancelled {
+    pub version: u32,
+    /// Admin that cancelled the proposal.
+    pub cancelled_by: Address,
+    /// The proposed admin address that was rejected.
+    pub proposed_admin: Address,
+    /// Ledger timestamp of cancellation.
+    pub cancelled_at: u64,
+}
+
+/// Emit [`AdminRotationCancelled`].
+pub fn emit_admin_rotation_cancelled(env: &Env, event: AdminRotationCancelled) {
+    let topics = (symbol_short!("adm_can"),);
+    env.events().publish(topics, event);
+}

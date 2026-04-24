@@ -3,7 +3,7 @@
   "contract_name": "BountyEscrowContract",
   "contract_purpose": "Manages bounty escrow with multi-token support, capability-based authorization, fee configuration, and comprehensive security features including reentrancy protection and rate limiting",
   "version": {
-    "current": "2.0.0",
+    "current": "2.5.0",
     "schema": "1.0.0",
     "history": [
       {
@@ -34,6 +34,20 @@
           "Added explicit refund eligibility view with deterministic semantics",
           "Added refund approval audit events for approval set/consumption lifecycle",
           "Added upgrade-safe storage marker for refund eligibility schema versioning"
+        ]
+      },
+      {
+        "version": "2.5.0",
+        "release_date": "2026-04-23",
+        "changes": [
+          "Added propose_admin_rotation: two-step admin rotation with configurable timelock [1h, 7d]",
+          "Added accept_admin_rotation: proposed admin accepts after timelock elapses",
+          "Added cancel_admin_rotation: current admin cancels pending proposal",
+          "Added get_pending_admin_rotation: view current pending proposal",
+          "Added get_admin_rotation_schema_version: upgrade-safe schema version view",
+          "Added AdminRotationProposed, AdminRotationAccepted, AdminRotationCancelled audit events",
+          "Added AdminRotationSchemaVersion upgrade-safe storage key written on init",
+          "Added NoPendingAdminRotation (47), AdminRotationTimelockActive (48), AdminRotationAlreadyPending (49), InvalidAdminRotationDelay (50) error codes"
         ]
       }
     ]
@@ -682,6 +696,54 @@
         "authorization": "admin",
         "pausable": false,
         "gas_estimate": "high"
+      },
+      {
+        "name": "propose_admin_rotation",
+        "description": "Step 1: current admin proposes a new admin with a timelock delay [1h, 7d]. Emits AdminRotationProposed.",
+        "parameters": [
+          {"name": "new_admin", "type": "Address", "description": "Proposed new admin address"},
+          {"name": "delay_secs", "type": "u64", "description": "Timelock delay in seconds [3600, 604800]"}
+        ],
+        "returns": {"type": "()", "description": "Empty on success"},
+        "authorization": "admin",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "accept_admin_rotation",
+        "description": "Step 2: proposed admin accepts after timelock elapses. Emits AdminRotationAccepted.",
+        "parameters": [],
+        "returns": {"type": "()", "description": "Empty on success"},
+        "authorization": "proposed_admin",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "cancel_admin_rotation",
+        "description": "Current admin cancels a pending rotation proposal. Emits AdminRotationCancelled.",
+        "parameters": [],
+        "returns": {"type": "()", "description": "Empty on success"},
+        "authorization": "admin",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "get_pending_admin_rotation",
+        "description": "Return the pending admin rotation proposal, if one exists.",
+        "parameters": [],
+        "returns": {"type": "Option<PendingAdminRotation>", "description": "Pending proposal or None"},
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "get_admin_rotation_schema_version",
+        "description": "Return the admin-rotation storage schema version written during init. Returns 0 on legacy deployments.",
+        "parameters": [],
+        "returns": {"type": "u32", "description": "Schema version (1 = current; 0 = legacy pre-v2.5)"},
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
       }
     ]
   },
@@ -789,6 +851,18 @@
         "type": "instance",
         "description": "Version marker for refund eligibility view semantics",
         "data_structure": "u32"
+      },
+      {
+        "name": "AdminRotationSchemaVersion",
+        "type": "instance",
+        "description": "Upgrade-safe version marker for admin-rotation storage layout. Increment when PendingAdminRotation layout changes.",
+        "data_structure": "u32"
+      },
+      {
+        "name": "PendingAdminRotation",
+        "type": "instance",
+        "description": "Pending two-step admin rotation proposal. Present only when a rotation is in progress.",
+        "data_structure": "PendingAdminRotation"
       },
       {
         "name": "ReentrancyGuard",
@@ -1066,6 +1140,43 @@
           }
         ],
         "trigger": "Successful refund call with admin approval record"
+      },
+      {
+        "name": "AdminRotationProposed",
+        "description": "Emitted when the current admin proposes a new admin with a timelock",
+        "topics": ["adm_prop"],
+        "data": [
+          {"name": "version", "type": "u32", "description": "Always EVENT_VERSION_V2"},
+          {"name": "current_admin", "type": "Address", "description": "Admin that created the proposal"},
+          {"name": "proposed_admin", "type": "Address", "description": "Proposed new admin address"},
+          {"name": "proposed_at", "type": "u64", "description": "Ledger timestamp of proposal"},
+          {"name": "executable_after", "type": "u64", "description": "Earliest timestamp for acceptance"}
+        ],
+        "trigger": "Every successful propose_admin_rotation call"
+      },
+      {
+        "name": "AdminRotationAccepted",
+        "description": "Emitted when the proposed admin accepts and becomes the new admin",
+        "topics": ["adm_acc"],
+        "data": [
+          {"name": "version", "type": "u32", "description": "Always EVENT_VERSION_V2"},
+          {"name": "old_admin", "type": "Address", "description": "Previous admin address"},
+          {"name": "new_admin", "type": "Address", "description": "New active admin address"},
+          {"name": "accepted_at", "type": "u64", "description": "Ledger timestamp of acceptance"}
+        ],
+        "trigger": "Every successful accept_admin_rotation call"
+      },
+      {
+        "name": "AdminRotationCancelled",
+        "description": "Emitted when the current admin cancels a pending rotation proposal",
+        "topics": ["adm_can"],
+        "data": [
+          {"name": "version", "type": "u32", "description": "Always EVENT_VERSION_V2"},
+          {"name": "cancelled_by", "type": "Address", "description": "Admin that cancelled"},
+          {"name": "proposed_admin", "type": "Address", "description": "The rejected proposed admin"},
+          {"name": "cancelled_at", "type": "u64", "description": "Ledger timestamp of cancellation"}
+        ],
+        "trigger": "Every successful cancel_admin_rotation call"
       }
     ]
   },
