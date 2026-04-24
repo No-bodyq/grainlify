@@ -3,7 +3,7 @@
   "contract_name": "ProgramEscrowContract",
   "contract_purpose": "Handles hackathon and program prize pools with batch payouts, dependency management, circuit breaker protection, and comprehensive monitoring",
   "version": {
-    "current": "2.4.0",
+    "current": "2.5.0",
     "schema": "1.0.0",
     "history": [
       {
@@ -71,6 +71,20 @@
           "Added get_pause_schema_version() view entrypoint — returns 0 for legacy pre-v1 contracts",
           "Pause checks remain deterministic: release_paused blocks single_payout and batch_payout; lock_paused blocks lock_program_funds; flags are orthogonal",
           "Added 16 targeted tests in test.rs covering pause invariants, V2 event fields, schema version, and edge cases"
+        ]
+      },
+      {
+        "version": "2.5.0",
+        "release_date": "2026-04-24",
+        "changes": [
+          "Added BatchPayoutError enum (codes 3100-3112) with explicit typed errors for all batch payout failure modes",
+          "Refactored batch_payout_internal to return Result<ProgramData, BatchPayoutError> — all pre-validation (zero amounts, duplicates, overflow) runs before any token transfer",
+          "Added try_batch_payout public entrypoint returning Result for typed error handling",
+          "Added get_batch_payout_schema_version view entrypoint",
+          "Added BatchPayoutSchemaVersion DataKey — upgrade-safe storage marker written at init",
+          "Added BATCH_PAYOUT_SCHEMA_VERSION_V1 constant (value: 1)",
+          "Duplicate-recipient detection added to batch_payout pre-validation phase",
+          "batch_payout and batch_payout_by retain panic-based API for backward compatibility"
         ]
       },
       {
@@ -212,6 +226,29 @@
         "returns": {
           "type": "Vec<PayoutRecord>",
           "description": "Array of payout records"
+        },
+        "authorization": "admin",
+        "pausable": true,
+        "gas_estimate": "high"
+      },
+      {
+        "name": "try_batch_payout",
+        "description": "Typed batch payout — returns Result<ProgramData, BatchPayoutError> instead of panicking. All pre-validation (zero amounts, duplicates, overflow) runs before any token transfer.",
+        "parameters": [
+          {
+            "name": "recipients",
+            "type": "Vec<Address>",
+            "description": "Array of recipient addresses (must be unique)"
+          },
+          {
+            "name": "amounts",
+            "type": "Vec<i128>",
+            "description": "Corresponding payout amounts (all must be > 0)"
+          }
+        ],
+        "returns": {
+          "type": "Result<ProgramData, BatchPayoutError>",
+          "description": "Updated program data on success, typed error on failure"
         },
         "authorization": "admin",
         "pausable": true,
@@ -831,6 +868,12 @@
         "data_structure": "u32"
       },
       {
+        "name": "DataKey::BatchPayoutSchemaVersion",
+        "type": "instance",
+        "description": "Upgrade-safe version marker for batch payout logic. Written at init with value BATCH_PAYOUT_SCHEMA_VERSION_V1=1. Returns 0 on legacy pre-v1 contracts.",
+        "data_structure": "u32"
+      },
+      {
         "name": "SCHEDULES",
         "type": "instance",
         "description": "Release schedules",
@@ -931,6 +974,71 @@
         "error_code": "DependencyCycle",
         "scenario": "Creating circular dependencies between programs",
         "resolution": "Remove circular dependency references"
+      },
+      {
+        "error_code": "BatchPayoutError::NotInitialized (3100)",
+        "scenario": "batch_payout called before program is initialized",
+        "resolution": "Call init_program first"
+      },
+      {
+        "error_code": "BatchPayoutError::Paused (3101)",
+        "scenario": "Release operations are paused",
+        "resolution": "Wait for admin to unpause release operations"
+      },
+      {
+        "error_code": "BatchPayoutError::DisputeOpen (3102)",
+        "scenario": "A dispute is open; payouts are blocked",
+        "resolution": "Resolve the active dispute before triggering payouts"
+      },
+      {
+        "error_code": "BatchPayoutError::Unauthorized (3103)",
+        "scenario": "Caller is not the authorized payout key, admin, or permitted delegate",
+        "resolution": "Use the authorized payout key or admin account"
+      },
+      {
+        "error_code": "BatchPayoutError::LengthMismatch (3104)",
+        "scenario": "recipients and amounts vectors have different lengths",
+        "resolution": "Ensure both vectors have the same number of elements"
+      },
+      {
+        "error_code": "BatchPayoutError::EmptyBatch (3105)",
+        "scenario": "Batch contains zero entries",
+        "resolution": "Provide at least one recipient and amount"
+      },
+      {
+        "error_code": "BatchPayoutError::ZeroAmount (3106)",
+        "scenario": "At least one amount is zero or negative",
+        "resolution": "All amounts must be strictly positive"
+      },
+      {
+        "error_code": "BatchPayoutError::AmountOverflow (3107)",
+        "scenario": "Summing amounts would overflow i128",
+        "resolution": "Reduce batch size or individual amounts"
+      },
+      {
+        "error_code": "BatchPayoutError::SpendLimitExceeded (3108)",
+        "scenario": "Batch total exceeds the per-program spend threshold",
+        "resolution": "Increase the spend threshold or split into smaller batches"
+      },
+      {
+        "error_code": "BatchPayoutError::InsufficientBalance (3109)",
+        "scenario": "Batch total exceeds the program's remaining balance",
+        "resolution": "Lock more funds or reduce payout amounts"
+      },
+      {
+        "error_code": "BatchPayoutError::CircuitBreakerOpen (3110)",
+        "scenario": "Circuit breaker is open due to repeated failures",
+        "resolution": "Reset the circuit breaker via reset_circuit_breaker"
+      },
+      {
+        "error_code": "BatchPayoutError::DuplicateRecipient (3111)",
+        "scenario": "Batch contains duplicate recipient addresses",
+        "resolution": "Ensure all recipient addresses are unique within the batch"
+      },
+      {
+        "error_code": "BatchPayoutError::FeeConsumesAmount (3112)",
+        "scenario": "Payout fee would consume an entire individual payout",
+        "resolution": "Increase payout amount or reduce fee rate"
       }
     ],
     "gas_considerations": [

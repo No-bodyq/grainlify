@@ -3039,3 +3039,209 @@ fn test_pause_reason_cleared_on_full_unpause() {
     let flags = client.get_pause_flags();
     assert_eq!(flags.pause_reason, None, "reason must be cleared when fully unpaused");
 }
+
+// =============================================================================
+// Batch Payout Atomicity Tests (feature/program-escrow-04)
+// =============================================================================
+
+/// BP-01: Successful batch payout transfers tokens and updates balance.
+#[test]
+fn test_batch_payout_atomicity_success() {
+    let env = Env::default();
+    let (client, _admin, token_client, _token_admin) = setup_program(&env, 100_000);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+
+    let data = client.batch_payout(
+        &vec![&env, r1.clone(), r2.clone(), r3.clone()],
+        &vec![&env, 10_000_i128, 20_000_i128, 30_000_i128],
+    );
+
+    assert_eq!(data.remaining_balance, 40_000);
+    assert_eq!(data.payout_history.len(), 3);
+    assert_eq!(token_client.balance(&r1), 10_000);
+    assert_eq!(token_client.balance(&r2), 20_000);
+    assert_eq!(token_client.balance(&r3), 30_000);
+    assert_eq!(token_client.balance(&client.address), 40_000);
+}
+
+/// BP-02: Zero amount in batch is rejected; no state change.
+#[test]
+#[should_panic(expected = "All amounts must be greater than zero")]
+fn test_batch_payout_zero_amount_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 50_000);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    // r2 gets 0 — must be rejected before any transfer
+    client.batch_payout(
+        &vec![&env, r1, r2],
+        &vec![&env, 10_000_i128, 0_i128],
+    );
+}
+
+/// BP-03: Zero amount rejection leaves balance unchanged (atomicity).
+#[test]
+fn test_batch_payout_zero_amount_no_partial_state() {
+    let env = Env::default();
+    let (client, _admin, token_client, _token_admin) = setup_program(&env, 50_000);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+
+    let result = client.try_batch_payout(
+        &vec![&env, r1.clone(), r2.clone()],
+        &vec![&env, 10_000_i128, 0_i128],
+    );
+    assert!(result.is_err());
+
+    // No tokens should have moved
+    assert_eq!(token_client.balance(&r1), 0);
+    assert_eq!(token_client.balance(&r2), 0);
+    assert_eq!(client.get_remaining_balance(), 50_000);
+}
+
+/// BP-04: Duplicate recipients are rejected.
+#[test]
+#[should_panic(expected = "Duplicate recipient in batch")]
+fn test_batch_payout_duplicate_recipients_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 50_000);
+
+    let r1 = Address::generate(&env);
+    client.batch_payout(
+        &vec![&env, r1.clone(), r1.clone()],
+        &vec![&env, 10_000_i128, 10_000_i128],
+    );
+}
+
+/// BP-05: Duplicate recipient rejection leaves balance unchanged (atomicity).
+#[test]
+fn test_batch_payout_duplicate_no_partial_state() {
+    let env = Env::default();
+    let (client, _admin, token_client, _token_admin) = setup_program(&env, 50_000);
+
+    let r1 = Address::generate(&env);
+
+    let result = client.try_batch_payout(
+        &vec![&env, r1.clone(), r1.clone()],
+        &vec![&env, 10_000_i128, 10_000_i128],
+    );
+    assert!(result.is_err());
+
+    assert_eq!(token_client.balance(&r1), 0);
+    assert_eq!(client.get_remaining_balance(), 50_000);
+}
+
+/// BP-06: Insufficient balance is rejected; no partial payout.
+#[test]
+#[should_panic(expected = "Insufficient balance")]
+fn test_batch_payout_insufficient_balance_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 5_000);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    client.batch_payout(
+        &vec![&env, r1, r2],
+        &vec![&env, 3_000_i128, 3_000_i128], // total 6_000 > 5_000
+    );
+}
+
+/// BP-07: Overflow in total amount is rejected.
+#[test]
+fn test_batch_payout_overflow_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 0);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+
+    let result = client.try_batch_payout(
+        &vec![&env, r1, r2],
+        &vec![&env, i128::MAX, 1_i128],
+    );
+    assert!(result.is_err());
+}
+
+/// BP-08: Empty batch is rejected.
+#[test]
+#[should_panic(expected = "Cannot process empty batch")]
+fn test_batch_payout_empty_batch_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 10_000);
+
+    client.batch_payout(&vec![&env], &vec![&env]);
+}
+
+/// BP-09: Length mismatch is rejected.
+#[test]
+#[should_panic(expected = "Recipients and amounts vectors must have the same length")]
+fn test_batch_payout_length_mismatch_rejected() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 10_000);
+
+    let r1 = Address::generate(&env);
+    client.batch_payout(
+        &vec![&env, r1],
+        &vec![&env, 1_000_i128, 2_000_i128],
+    );
+}
+
+/// BP-10: Schema version is readable and equals 1 after init.
+#[test]
+fn test_batch_payout_schema_version_readable() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 0);
+
+    let version = client.get_batch_payout_schema_version();
+    assert_eq!(version, 1, "schema version must be 1 after init");
+}
+
+/// BP-11: try_batch_payout returns typed error for zero amount.
+#[test]
+fn test_try_batch_payout_returns_typed_error_zero_amount() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 50_000);
+
+    let r1 = Address::generate(&env);
+    let result = client.try_batch_payout(
+        &vec![&env, r1],
+        &vec![&env, 0_i128],
+    );
+    assert!(result.is_err());
+}
+
+/// BP-12: try_batch_payout returns typed error for duplicate recipients.
+#[test]
+fn test_try_batch_payout_returns_typed_error_duplicate() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 50_000);
+
+    let r1 = Address::generate(&env);
+    let result = client.try_batch_payout(
+        &vec![&env, r1.clone(), r1.clone()],
+        &vec![&env, 1_000_i128, 1_000_i128],
+    );
+    assert!(result.is_err());
+}
+
+/// BP-13: Payout history grows correctly across multiple batch calls.
+#[test]
+fn test_batch_payout_history_accumulates() {
+    let env = Env::default();
+    let (client, _admin, _token, _token_admin) = setup_program(&env, 100_000);
+
+    let r1 = Address::generate(&env);
+    let r2 = Address::generate(&env);
+    let r3 = Address::generate(&env);
+
+    client.batch_payout(&vec![&env, r1, r2], &vec![&env, 10_000_i128, 20_000_i128]);
+    let data = client.batch_payout(&vec![&env, r3], &vec![&env, 5_000_i128]);
+
+    assert_eq!(data.payout_history.len(), 3);
+    assert_eq!(data.remaining_balance, 65_000);
+}

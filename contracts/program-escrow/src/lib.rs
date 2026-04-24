@@ -144,6 +144,9 @@ use soroban_sdk::{
     String, Symbol, Vec,
 };
 
+mod errors;
+pub use errors::BatchPayoutError;
+
 // Event types
 const PROGRAM_INITIALIZED: Symbol = symbol_short!("PrgInit");
 const FUNDS_LOCKED: Symbol = symbol_short!("FndsLock");
@@ -598,6 +601,7 @@ const DISPUTE_RESOLVED: Symbol = symbol_short!("DspRslv");
 const SPEND_LIMIT_SET: Symbol = symbol_short!("SpLimSet");
 const SPEND_LIMIT_EXCEEDED: Symbol = symbol_short!("SpLimExc");
 const SPEND_LIMIT_SCHEMA: Symbol = symbol_short!("SpLimSch");
+const BATCH_PAYOUT_SCHEMA: Symbol = symbol_short!("BatPaySch");
 
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -625,6 +629,9 @@ pub enum DataKey {
     /// Upgrade-safe schema version marker for pause flags storage.
     /// Written on init; increment when `PauseFlags` layout changes.
     PauseSchemaVersion,
+    /// Upgrade-safe schema version marker for batch payout storage.
+    /// Written on init; increment when batch payout logic changes in a breaking way.
+    BatchPayoutSchemaVersion,
 }
 
 #[contracttype]
@@ -886,6 +893,13 @@ pub const SPEND_LIMIT_SCHEMA_VERSION_V1: u32 = 1;
 /// Written to instance storage during `init` so upgrade safety checks can
 /// detect schema mismatches on legacy deployments.
 pub const PAUSE_SCHEMA_VERSION_V1: u32 = 1;
+
+/// Current batch payout storage schema version.
+///
+/// Increment whenever batch payout logic changes in a breaking way.
+/// Written to instance storage during `init` so upgrade safety checks can
+/// detect schema mismatches on legacy deployments.
+pub const BATCH_PAYOUT_SCHEMA_VERSION_V1: u32 = 1;
 
 fn default_history_pagination_config() -> HistoryPaginationConfig {
     HistoryPaginationConfig {
@@ -1348,6 +1362,22 @@ impl ProgramEscrowContract {
             env.storage().instance().set(
                 &DataKey::PauseSchemaVersion,
                 &PAUSE_SCHEMA_VERSION_V1,
+            );
+        }
+
+        // Write upgrade-safe batch payout schema version marker.
+        if !env
+            .storage()
+            .instance()
+            .has(&DataKey::BatchPayoutSchemaVersion)
+        {
+            env.storage().instance().set(
+                &DataKey::BatchPayoutSchemaVersion,
+                &BATCH_PAYOUT_SCHEMA_VERSION_V1,
+            );
+            env.events().publish(
+                (BATCH_PAYOUT_SCHEMA,),
+                (EVENT_VERSION_V2, BATCH_PAYOUT_SCHEMA_VERSION_V1, env.ledger().timestamp()),
             );
         }
 
@@ -2634,6 +2664,7 @@ impl ProgramEscrowContract {
     /// - Respects circuit breaker and threshold limits.
     pub fn batch_payout(env: Env, recipients: soroban_sdk::Vec<Address>, amounts: soroban_sdk::Vec<i128>) -> ProgramData {
         Self::batch_payout_internal(env, None, recipients, amounts)
+            .unwrap_or_else(|e| panic!("{}", e.description()))
     }
 
     pub fn batch_payout_by(
@@ -2643,6 +2674,19 @@ impl ProgramEscrowContract {
         amounts: soroban_sdk::Vec<i128>,
     ) -> ProgramData {
         Self::batch_payout_internal(env, Some(caller), recipients, amounts)
+            .unwrap_or_else(|e| panic!("{}", e.description()))
+    }
+
+    /// Typed batch payout — returns `Err(BatchPayoutError)` instead of panicking.
+    ///
+    /// Prefer this over `batch_payout` when the caller needs to inspect the
+    /// specific failure mode without catching a panic.
+    pub fn try_batch_payout(
+        env: Env,
+        recipients: soroban_sdk::Vec<Address>,
+        amounts: soroban_sdk::Vec<i128>,
+    ) -> Result<ProgramData, BatchPayoutError> {
+        Self::batch_payout_internal(env, None, recipients, amounts)
     }
 
     fn batch_payout_internal(
@@ -2650,92 +2694,102 @@ impl ProgramEscrowContract {
         caller: Option<Address>,
         recipients: soroban_sdk::Vec<Address>,
         amounts: soroban_sdk::Vec<i128>,
-    ) -> ProgramData {
+    ) -> Result<ProgramData, BatchPayoutError> {
         // Validation precedence (deterministic ordering):
         // 1. Reentrancy guard
         // 2. Contract initialized
         // 3. Paused (operational state)
+        // 3b. Dispute guard
         // 4. Authorization
-        // 6. Business logic (sufficient balance)
-        // 7. Circuit breaker check
+        // 5. Input validation (length, empty, zero amounts, duplicates)
+        // 6. Compute total atomically (overflow check)
+        // 7. Business logic (spend threshold, balance)
+        // 8. Circuit breaker check
+        // 9. Execute transfers
 
         // 1. Reentrancy guard
         reentrancy_guard::check_not_entered(&env);
         reentrancy_guard::set_entered(&env);
 
+        macro_rules! bail {
+            ($err:expr) => {{
+                reentrancy_guard::clear_entered(&env);
+                return Err($err);
+            }};
+        }
+
         // 2. Contract must be initialized
-        let program_data: ProgramData =
-            env.storage()
-                .instance()
-                .get(&PROGRAM_DATA)
-                .unwrap_or_else(|| {
-                    reentrancy_guard::clear_entered(&env);
-                    panic!("Program not initialized")
-                });
+        let program_data: ProgramData = match env.storage().instance().get(&PROGRAM_DATA) {
+            Some(d) => d,
+            None => bail!(BatchPayoutError::NotInitialized),
+        };
 
         // 3. Operational state: paused
         if Self::check_paused(&env, symbol_short!("release")) {
-            reentrancy_guard::clear_entered(&env);
-            panic!("Funds Paused");
+            bail!(BatchPayoutError::Paused);
         }
 
         // 3b. Dispute guard — payouts blocked while a dispute is open
         if Self::dispute_state(&env) == DisputeState::Open {
-            reentrancy_guard::clear_entered(&env);
-            panic!("Payout blocked: dispute open");
+            bail!(BatchPayoutError::DisputeOpen);
         }
 
         // 4. Authorization
         Self::authorize_release_actor(&env, &program_data, caller.as_ref());
 
-        // 5. Input validation
+        // 5a. Length / empty checks
         if recipients.len() != amounts.len() {
-            reentrancy_guard::clear_entered(&env);
-            panic!("Recipients and amounts vectors must have the same length");
+            bail!(BatchPayoutError::LengthMismatch);
         }
-
         if recipients.len() == 0 {
-            reentrancy_guard::clear_entered(&env);
-            panic!("Cannot process empty batch");
+            bail!(BatchPayoutError::EmptyBatch);
         }
 
-        // Calculate total payout amount
+        // 5b. Pre-validate every entry: zero amounts and duplicate recipients.
+        //     Both checks run over the full list before any transfer so the
+        //     batch is truly atomic — no partial state on failure.
+        for i in 0..amounts.len() {
+            if amounts.get(i).unwrap() <= 0 {
+                bail!(BatchPayoutError::ZeroAmount);
+            }
+        }
+        // Duplicate-recipient check (O(n²) — acceptable for MAX_BATCH_SIZE ≤ 100)
+        for i in 0..recipients.len() {
+            for j in (i + 1)..recipients.len() {
+                if recipients.get(i).unwrap() == recipients.get(j).unwrap() {
+                    bail!(BatchPayoutError::DuplicateRecipient);
+                }
+            }
+        }
+
+        // 6. Compute total atomically — overflow is a hard error.
         let mut total_payout: i128 = 0;
         for amount in amounts.iter() {
-            if amount <= 0 {
-                reentrancy_guard::clear_entered(&env);
-                panic!("All amounts must be greater than zero");
-            }
-            total_payout = total_payout.checked_add(amount).unwrap_or_else(|| {
-                reentrancy_guard::clear_entered(&env);
-                panic!("Payout amount overflow")
-            });
+            total_payout = match total_payout.checked_add(amount) {
+                Some(v) => v,
+                None => bail!(BatchPayoutError::AmountOverflow),
+            };
         }
 
-        // 6. Business logic: sufficient balance
-        // Deterministic error ordering: spend threshold check runs before
-        // balance/circuit checks, so clients observe stable failures.
+        // 7. Business logic: spend threshold then balance.
         if Self::enforce_spend_threshold(&env, &program_data.program_id, total_payout).is_err() {
-            reentrancy_guard::clear_entered(&env);
-            panic!("Spend threshold exceeded");
+            bail!(BatchPayoutError::SpendLimitExceeded);
         }
-
         if total_payout > program_data.remaining_balance {
-            reentrancy_guard::clear_entered(&env);
-            panic!("Insufficient balance");
+            bail!(BatchPayoutError::InsufficientBalance);
         }
 
-        // 7. Circuit breaker check
+        // 8. Circuit breaker check
         if let Err(err_code) = error_recovery::check_and_allow_with_thresholds(&env) {
             reentrancy_guard::clear_entered(&env);
             if err_code == error_recovery::ERR_CIRCUIT_OPEN {
-                panic!("Circuit breaker is OPEN");
+                return Err(BatchPayoutError::CircuitBreakerOpen);
             } else {
-                panic!("Operation rejected by circuit breaker");
+                return Err(BatchPayoutError::CircuitBreakerOpen);
             }
         }
 
-        // Execute transfers
+        // 9. Execute transfers — all pre-validation passed; this section must not fail.
         let mut updated_history = program_data.payout_history.clone();
         let timestamp = env.ledger().timestamp();
         let contract_address = env.current_contract_address();
@@ -2752,11 +2806,10 @@ impl ProgramEscrowContract {
                 cfg.payout_fixed_fee,
                 cfg.fee_enabled,
             );
-            let net = gross.checked_sub(pay_fee).unwrap_or(0);
-            if net <= 0 {
-                reentrancy_guard::clear_entered(&env);
-                panic!("Payout fee consumes entire payout");
-            }
+            let net = match gross.checked_sub(pay_fee) {
+                Some(v) if v > 0 => v,
+                _ => bail!(BatchPayoutError::FeeConsumesAmount),
+            };
 
             if pay_fee > 0 {
                 token_client.transfer(&contract_address, &cfg.fee_recipient, &pay_fee);
@@ -2776,12 +2829,11 @@ impl ProgramEscrowContract {
             threshold_monitor::record_operation_success(&env);
             threshold_monitor::record_outflow(&env, gross);
 
-            let payout_record = PayoutRecord {
+            updated_history.push_back(PayoutRecord {
                 recipient,
                 amount: net,
                 timestamp,
-            };
-            updated_history.push_back(payout_record);
+            });
         }
 
         // Update program data
@@ -2789,10 +2841,8 @@ impl ProgramEscrowContract {
         updated_data.remaining_balance -= total_payout;
         updated_data.payout_history = updated_history;
 
-        // Store updated data
         env.storage().instance().set(&PROGRAM_DATA, &updated_data);
 
-        // Emit BatchPayout event
         env.events().publish(
             (BATCH_PAYOUT,),
             BatchPayoutEvent {
@@ -2804,10 +2854,17 @@ impl ProgramEscrowContract {
             },
         );
 
-        // Clear reentrancy guard before returning
         reentrancy_guard::clear_entered(&env);
+        Ok(updated_data)
+    }
 
-        updated_data
+    /// Returns the batch payout storage schema version written during `init_program`.
+    /// Returns `0` on legacy deployments where the marker was never written.
+    pub fn get_batch_payout_schema_version(env: Env) -> u32 {
+        env.storage()
+            .instance()
+            .get(&DataKey::BatchPayoutSchemaVersion)
+            .unwrap_or(0u32)
     }
 
     /// Execute a single payout to one winner.
