@@ -844,6 +844,23 @@ pub struct FreezeRecord {
     pub frozen_by: Address,
 }
 
+/// Pending two-step admin rotation proposal.
+///
+/// Created by `propose_admin_rotation`; consumed by `accept_admin_rotation`.
+/// Cancelled by `cancel_admin_rotation` (current admin only).
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct PendingAdminRotation {
+    /// The proposed new admin address.
+    pub proposed_admin: Address,
+    /// Ledger timestamp when the proposal was created.
+    pub proposed_at: u64,
+    /// Earliest ledger timestamp at which `accept_admin_rotation` may be called.
+    pub executable_after: u64,
+    /// Current admin that created the proposal.
+    pub proposed_by: Address,
+}
+
 #[contracttype]
 pub enum DataKey {
     Admin,
