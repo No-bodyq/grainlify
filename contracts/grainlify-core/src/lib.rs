@@ -1,27 +1,5 @@
-
-//! # Grainlify Contract Upgrade System
-//!
-//! Secure contract upgrade pattern with admin-controlled WASM updates,
-//! version tracking, migration replay protection, and multisig governance.
-//!
-//! ## Security Model
-//! - Admin address is immutable after initialization
-//! - All upgrades require multisig threshold OR single admin authorization
-//! - Migrations are replay-protected via pre-committed hashes
-//! - Timelock enforces review window before upgrade execution
-//! - Read-only mode blocks all mutations during incidents
-
 #![no_std]
-
-mod multisig;
-use multisig::MultiSig;
-use soroban_sdk::{
-    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
-    String, Symbol, Vec,
-};
-
-#[cfg(test)]
-use soroban_sdk::testutils::Address as _;
+use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
 pub mod asset;
 pub mod commit_reveal;
 pub mod error_registry;
@@ -60,13 +38,6 @@ pub enum ContractError {
     /// Snapshot was pruned and is no longer available
     SnapshotPruned = 107,
 }
-
-// ============================================================================
-// Constants
-// ============================================================================
-
-#[cfg(feature = "contract")]
-const VERSION: u32 = 2;
 pub const STORAGE_SCHEMA_VERSION: u32 = 1;
 pub const LIVENESS_SCHEMA_VERSION: u32 = 1;
 const CONFIG_SNAPSHOT_LIMIT: u32 = 20;
@@ -355,11 +326,8 @@ pub struct LivenessStatus {
 /// - Timelock delay prevents immediate execution after threshold approval
 #[contracttype]
 #[derive(Clone)]
-enum DataKey {
-     /// Administrator address with upgrade authority
-    /// - Immutable after initialization via init_admin()
-    /// - Required for all admin operations (upgrade, migrate, set_version)
-    /// - Persists across all WASM upgrades
+pub enum DataKey {
+    RegEntry(Symbol),
     Admin,
 
     /// Current version number (increments with upgrades)
@@ -771,9 +739,7 @@ mod test_contract_registry;
 
 #[cfg(feature = "contract")]
 #[contract]
-pub struct GrainlifyContract;
-
-#[cfg(feature = "contract")]
+pub struct GrainlifyRegistry;
 #[contractimpl]
 impl GrainlifyContract {
     /// One-time initialization: set the admin and initial version. Requires `admin` auth.
@@ -820,43 +786,12 @@ impl GrainlifyContract {
             let remaining = timelock_delay.saturating_sub(elapsed);
             panic!("Timelock delay not met: {} seconds remaining", remaining);
         }
-
-        let proposal = Self::load_upgrade_proposal(&env, proposal_id)
-            .expect("Missing upgrade proposal");
-
-        let current_version: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(1);
-        env.storage().instance().set(&DataKey::PreviousVersion, &current_version);
-
-        env.deployer().update_current_contract_wasm(proposal.wasm_hash.clone());
-
-        // [FIX-L02] Emit previous_version (not current) so indexers know what changed FROM
-        env.events().publish(
-            (symbol_short!("upgrade"), symbol_short!("wasm")),
-            UpgradeEvent {
-                new_wasm_hash: proposal.wasm_hash.clone(),
-                previous_version: current_version,
-                timestamp: env.ledger().timestamp(),
-            },
-        );
-
-        MultiSig::mark_executed(&env, proposal_id);
-        env.storage().instance().remove(&DataKey::UpgradeTimelock(proposal_id));
-
-        monitoring::track_operation(
-            &env, Symbol::new(&env, "execute_upgrade"),
-            env.current_contract_address(), true,
-        );
-        let duration = env.ledger().timestamp().saturating_sub(start);
-        monitoring::emit_performance(&env, Symbol::new(&env, "execute_upgrade"), duration);
+        e.storage().instance().set(&DataKey::Admin, &admin);
     }
-
-    fn load_upgrade_proposal(env: &Env, proposal_id: u64) -> Option<UpgradeProposalRecord> {
-        let wasm_hash = env.storage().instance().get(&DataKey::UpgradeProposal(proposal_id))?;
-        let proposer = env.storage().instance().get(&DataKey::UpgradeProposalProposer(proposal_id));
-        let (expiry, cancelled) = MultiSig::get_proposal_opt(env, proposal_id)
-            .map(|p| (p.expiry, p.cancelled))
-            .unwrap_or((0, false));
-        Some(UpgradeProposalRecord { proposal_id, proposer, wasm_hash, expiry, cancelled })
+    pub fn set_addr(e: Env, n: Symbol, a: Address) {
+        let adm: Address = e.storage().instance().get(&DataKey::Admin).unwrap();
+        adm.require_auth();
+        e.storage().persistent().set(&DataKey::RegEntry(n), &a);
     }
 
     /// Single-admin upgrade path
@@ -1695,20 +1630,4 @@ impl traits::UpgradeInterface for GrainlifyContract {
         Ok(())
     }
 }
-
-// ============================================================================
-// Migration Functions
-// ============================================================================
-
-fn migrate_v1_to_v2(_env: &Env) {
-    // No-op: v1 storage layout is compatible with v2
-    // Future: add data transformations here when needed
-}
-
-// [FIX-H01] Template for future migration — copy and implement:
-// fn migrate_v3_to_v4(env: &Env) {
-//     // 1. Read old data
-//     // 2. Transform to new schema
-//     // 3. Write new data
-//     // 4. Optionally remove old keys
-// }
+mod test;
