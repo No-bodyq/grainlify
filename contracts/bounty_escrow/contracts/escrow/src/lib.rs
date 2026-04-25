@@ -918,6 +918,14 @@ pub enum DataKey {
     /// Upgrade-safe marker for participant list storage semantics.
     /// Increment when `WhitelistIndex` / `BlocklistIndex` layout changes.
     ParticipantListSchemaVersion,
+    /// Pending admin address for two-step admin rotation.
+    PendingAdmin,
+    /// Timestamp when the admin rotation was proposed (for timelock enforcement).
+    AdminTransferTimestamp,
+    /// Global high-value release timelock configuration (threshold + duration).
+    HighValueConfig,
+    /// Per-bounty queued release entry awaiting timelock expiry.
+    QueuedRelease(u64),
 }
 
 #[contracttype]

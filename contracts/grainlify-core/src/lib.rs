@@ -273,35 +273,17 @@ pub struct WatchdogStatus {
     pub version: u32,
 }
 
-/// Unified liveness snapshot returned by `liveness_watchdog()`.
-///
-/// Consolidates fields from both the legacy and current monitoring views so
-/// that all test suites pass against a single entry-point function.
+/// Liveness snapshot returned by `liveness_watchdog`.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LivenessStatus {
-    /// `true` when MultiSig pause is active.
     pub is_paused: bool,
-    /// `true` when read-only mode is set.
     pub is_read_only: bool,
-    /// `true` when neither paused nor read-only (`!is_paused && !is_read_only`).
     pub is_operational: bool,
-    /// `true` when the admin key has been set via `init_admin`.
-    pub admin_set: bool,
-    /// Schema version written to `LivenessSchemaVersion` at init (0 on legacy deployments).
-    pub schema_version: u32,
-    /// Current ledger timestamp at the time of the call.
-    pub timestamp: u64,
-    /// Mirror of `is_paused` — matches `WatchdogStatus.paused` field name.
-    pub paused: bool,
-    /// Mirror of `is_read_only` — matches `WatchdogStatus.read_only` field name.
-    pub read_only: bool,
-    /// `true` when monitoring invariants pass.
-    pub healthy: bool,
-    /// Ledger timestamp of the last `ping_watchdog` call; `0` if never pinged.
-    pub last_ping_ts: u64,
-    /// Current contract version number.
     pub version: u32,
+    pub admin_set: bool,
+    pub timestamp: u64,
+    pub schema_version: u32,
 }
 
 /// Storage keys for contract data.
@@ -423,7 +405,7 @@ enum DataKey {
     /// Upgrade-safe schema version marker for liveness watchdog storage.
     /// Written on init_admin; increment when LivenessStatus layout changes.
     LivenessSchemaVersion,
-    /// Ledger timestamp of the last successful `ping_watchdog` call.
+    /// Timestamp of the last successful ping_watchdog call.
     WatchdogLastPing,
 }
 
@@ -775,7 +757,7 @@ impl GrainlifyContract {
         env.storage().instance().set(&DataKey::Version, &VERSION);
         env.storage().instance().set(&DataKey::ReadOnlyMode, &false);
         env.storage().instance().set(&DataKey::LivenessSchemaVersion, &LIVENESS_SCHEMA_VERSION);
-
+        
         // Emit BuildInfo event for initialization tracking and auditing
         env.events().publish(
             (symbol_short!("init"), symbol_short!("build")),
@@ -1417,6 +1399,10 @@ impl GrainlifyContract {
     pub fn can_execute(env: Env, proposal_id: u64) -> bool {
         MultiSig::can_execute(&env, proposal_id)
     }
+
+    // ========================================================================
+    // Liveness Watchdog
+    // ========================================================================
 
     /// Admin: record a liveness ping — updates `WatchdogLastPing` timestamp.
     ///
