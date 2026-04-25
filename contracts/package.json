@@ -6,7 +6,7 @@
   "scripts": {
     "validate-manifests": "node scripts/validate-manifests.js",
     "generate-docs": "node scripts/generate-docs.js",
-    "build": "npm run validate-manifests && npm run generate-docs",
+    "build": "node init && npm run validate-manifests && npm run generate-docs",
     "test": "npm run validate-manifests"
   },
   "devDependencies": {
