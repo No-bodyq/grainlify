@@ -2535,6 +2535,10 @@ impl BountyEscrowContract {
         }
 
         let flags = Self::get_pause_flags(env);
+        // Maintenance mode blocks ALL operations (lock, release, refund).
+        if Self::is_maintenance_mode(env.clone()) {
+            return true;
+        }
         if operation == symbol_short!("lock") {
             return flags.lock_paused;
         } else if operation == symbol_short!("release") {
@@ -2685,6 +2689,14 @@ impl BountyEscrowContract {
 
     /// Check if the contract is in maintenance mode
     pub fn is_maintenance_mode(env: Env) -> bool {
+        // Check structured record first (v2.5+), fall back to legacy bare bool.
+        if let Some(record) = env
+            .storage()
+            .instance()
+            .get::<DataKey, MaintenanceModeRecord>(&DataKey::MaintenanceModeInfo)
+        {
+            return record.enabled;
+        }
         env.storage()
             .instance()
             .get(&DataKey::MaintenanceMode)
@@ -2748,7 +2760,7 @@ impl BountyEscrowContract {
                 enabled,
                 reason,
                 admin: admin.clone(),
-                timestamp: env.ledger().timestamp(),
+                timestamp: now,
             },
         );
         Ok(())
