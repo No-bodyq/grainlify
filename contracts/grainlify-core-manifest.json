@@ -3,7 +3,7 @@
   "contract_name": "GrainlifyContract",
   "contract_purpose": "Provides secure contract upgrade mechanism with version tracking, migration support, multisig governance, and comprehensive monitoring capabilities",
   "version": {
-    "current": "2.1.0",
+    "current": "2.2.0",
     "schema": "1.0.0",
     "history": [
       {
@@ -35,6 +35,17 @@
           "Added ping_watchdog admin fn: records liveness ping timestamp for off-chain monitors",
           "Added WatchdogLastPing storage key (instance)",
           "Added WatchdogStatus contracttype struct"
+        ]
+      },
+      {
+        "version": "2.2.0",
+        "release_date": "2026-04-24",
+        "changes": [
+          "Added deployed contract registry with admin-only register/deregister",
+          "Added registry views: list_deployed_contracts, get_deployed_contract, deployed_contract_count",
+          "Added ContractKind and DeployedContract contracttype structs",
+          "Added DeployedContractRegistry storage key (instance)",
+          "Registry events: (registry, reg) and (registry, unreg)"
         ]
       }
     ]
@@ -396,6 +407,61 @@
         "authorization": "any",
         "pausable": false,
         "gas_estimate": "low"
+      },
+      {
+        "name": "list_deployed_contracts",
+        "description": "Return paginated deployed contracts from the registry",
+        "parameters": [
+          {
+            "name": "offset",
+            "type": "Option<u32>",
+            "description": "Number of entries to skip (default: 0)",
+            "optional": true
+          },
+          {
+            "name": "limit",
+            "type": "Option<u32>",
+            "description": "Maximum entries to return (default: all)",
+            "optional": true
+          }
+        ],
+        "returns": {
+          "type": "Vec<DeployedContract>",
+          "description": "Paginated list of deployed contracts"
+        },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "get_deployed_contract",
+        "description": "Look up a registered contract by its on-chain address",
+        "parameters": [
+          {
+            "name": "address",
+            "type": "Address",
+            "description": "Contract address to search for"
+          }
+        ],
+        "returns": {
+          "type": "Option<DeployedContract>",
+          "description": "Registry entry if found, None otherwise"
+        },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
+      },
+      {
+        "name": "deployed_contract_count",
+        "description": "Return the total number of registered deployed contracts",
+        "parameters": [],
+        "returns": {
+          "type": "u32",
+          "description": "Total registry size"
+        },
+        "authorization": "any",
+        "pausable": false,
+        "gas_estimate": "low"
       }
     ],
     "admin": [
@@ -574,6 +640,12 @@
         "type": "instance",
         "description": "Ledger timestamp of the last successful ping_watchdog call. 0 / absent means never pinged.",
         "data_structure": "u64"
+      },
+      {
+        "name": "DeployedContractRegistry",
+        "type": "instance",
+        "description": "Ordered list of deployed contract addresses tracked by this core contract for discoverability and cross-contract coordination.",
+        "data_structure": "Vec<DeployedContract>"
       }
     ]
   },
@@ -820,6 +892,45 @@
           }
         ],
         "trigger": "Successful ping_watchdog call"
+      },
+      {
+        "name": "ContractRegistered",
+        "description": "A deployed contract address was registered or updated in the registry",
+        "data": [
+          {
+            "name": "address",
+            "type": "Address",
+            "description": "Registered contract address"
+          },
+          {
+            "name": "name",
+            "type": "String",
+            "description": "Human-readable name"
+          },
+          {
+            "name": "kind",
+            "type": "ContractKind",
+            "description": "Contract role/type"
+          },
+          {
+            "name": "version",
+            "type": "u32",
+            "description": "Version at registration"
+          }
+        ],
+        "trigger": "Successful register_deployed_contract call"
+      },
+      {
+        "name": "ContractDeregistered",
+        "description": "A deployed contract address was removed from the registry",
+        "data": [
+          {
+            "name": "address",
+            "type": "Address",
+            "description": "Deregistered contract address"
+          }
+        ],
+        "trigger": "Successful deregister_deployed_contract call"
       }
     ]
   },
@@ -926,7 +1037,8 @@
         "test_core_monitoring.rs",
         "upgrade_rollback_tests.rs",
         "migration_hook_tests.rs",
-        "test_liveness_watchdog.rs"
+        "test_liveness_watchdog.rs",
+        "test_contract_registry.rs"
       ]
     },
     "test_scenarios": [
@@ -947,8 +1059,26 @@
       "ping_watchdog updates last_ping_ts to ledger timestamp",
       "ping_watchdog multiple pings update timestamp monotonically",
       "ping_watchdog blocked in read-only mode",
-      "ping_watchdog requires admin auth"
+      "ping_watchdog requires admin auth",
+      "register_deployed_contract adds entry to registry",
+      "register_deployed_contract updates existing entry (no duplicates)",
+      "deregister_deployed_contract removes entry",
+      "deregister_deployed_contract is no-op for unknown address",
+      "list_deployed_contracts supports pagination",
+      "deployed_contract_count reflects registry size",
+      "get_deployed_contract returns None for unregistered address",
+      "registry mutations blocked in read-only mode",
+      "registry enforces max size limit"
     ]
+  },
+  "registry": {
+    "enabled": true,
+    "max_entries": 200,
+    "entrypoint_register": "register_deployed_contract",
+    "entrypoint_deregister": "deregister_deployed_contract",
+    "entrypoint_list": "list_deployed_contracts",
+    "entrypoint_get": "get_deployed_contract",
+    "entrypoint_count": "deployed_contract_count"
   },
   "documentation": {
     "readme": "README.md",

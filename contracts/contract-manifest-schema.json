@@ -272,6 +272,40 @@
         }
       }
     },
+    "registry": {
+      "type": "object",
+      "description": "Deployed contract registry metadata",
+      "properties": {
+        "enabled": {
+          "type": "boolean",
+          "description": "Whether the contract maintains a registry of deployed addresses"
+        },
+        "max_entries": {
+          "type": "integer",
+          "description": "Maximum number of contracts that can be registered"
+        },
+        "entrypoint_register": {
+          "type": "string",
+          "description": "Entrypoint name for registering a contract"
+        },
+        "entrypoint_deregister": {
+          "type": "string",
+          "description": "Entrypoint name for deregistering a contract"
+        },
+        "entrypoint_list": {
+          "type": "string",
+          "description": "Entrypoint name for listing registered contracts"
+        },
+        "entrypoint_get": {
+          "type": "string",
+          "description": "Entrypoint name for getting a single registered contract"
+        },
+        "entrypoint_count": {
+          "type": "string",
+          "description": "Entrypoint name for getting the registry count"
+        }
+      }
+    },
     "documentation": {
       "type": "object",
       "description": "Documentation references",

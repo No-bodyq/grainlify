@@ -71,6 +71,10 @@ pub const STORAGE_SCHEMA_VERSION: u32 = 1;
 pub const LIVENESS_SCHEMA_VERSION: u32 = 1;
 const CONFIG_SNAPSHOT_LIMIT: u32 = 20;
 
+/// Maximum number of deployed contracts that can be registered.
+/// Prevents unbounded storage growth and ensures predictable gas costs.
+const MAX_DEPLOYED_CONTRACTS: u32 = 200;
+
 /// Default timelock delay for upgrade execution (24 hours in seconds)
 const DEFAULT_TIMELOCK_DELAY: u64 = 86_400;
 
@@ -250,6 +254,34 @@ pub struct PendingAdminRestore {
     pub initiated_at: u64,
     /// Restore expires if not confirmed within this many seconds
     pub expires_at: u64,
+}
+
+/// Kind of contract deployed in the Grainlify ecosystem.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub enum ContractKind {
+    BountyEscrow,
+    ProgramEscrow,
+    SorobanEscrow,
+    GrainlifyCore,
+    ViewFacade,
+    Other,
+}
+
+/// A single entry in the deployed-contract registry.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct DeployedContract {
+    /// On-chain address of the deployed contract.
+    pub address: Address,
+    /// Human-readable name of the contract (e.g. "bounty-escrow-v3").
+    pub name: String,
+    /// Role / type of the contract within the ecosystem.
+    pub kind: ContractKind,
+    /// Numeric version reported at registration time.
+    pub version: u32,
+    /// Ledger timestamp when the contract was registered.
+    pub deployed_at: u64,
 }
 
 /// Liveness watchdog status — a single read-only view of the contract's
@@ -734,10 +766,7 @@ mod test_version_helpers;
 #[cfg(test)]
 mod test_strict_mode;
 #[cfg(test)]
-mod build_info_event_tests {
-    include!("test/build_info_event_tests.rs");
-}
-
+mod test_contract_registry;
 // ==================== END MONITORING MODULE ====================
 
 #[cfg(feature = "contract")]

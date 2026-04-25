@@ -26,7 +26,9 @@ SCHEMA_PATH = CONTRACTS_DIR / "contract-manifest-schema.json"
 
 _SEMVER_RE = re.compile(r"^\d+\.\d+\.\d+$")
 _ISO_Z_RE = re.compile(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$")
-_VALID_AUTH = {"admin", "signer", "any", "capability", "multisig"}
+_VALID_AUTH = {"admin", "signer", "any", "capability", "multisig",
+                 "authorized_payout_key", "proposed_admin", "controller_or_admin",
+                 "proposed_controller"}
 _VALID_NETWORKS = {"testnet", "mainnet", "futurenet", "local"}
 _VALID_DEPLOYMENT_STATUS = {"deployed", "upgraded", "rolled_back", "failed"}
 
