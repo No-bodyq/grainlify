@@ -543,6 +543,21 @@
         "trigger": {
           "type": "string",
           "description": "When this event is emitted"
+        },
+        "topic": {
+          "type": "array",
+          "description": "Event topic path as emitted on-chain (e.g. [\"init\", \"build\"])",
+          "items": {
+            "type": "string"
+          }
+        },
+        "auth_context": {
+          "type": "string",
+          "description": "Authorization context required for the event to be emitted"
+        },
+        "security_notes": {
+          "type": "string",
+          "description": "Security and audit notes for the event"
         }
       }
     },

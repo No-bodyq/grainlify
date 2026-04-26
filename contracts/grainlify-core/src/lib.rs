@@ -105,8 +105,14 @@ pub struct ReadOnlyModeEvent {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct BuildInfoEvent {
-    /// The admin address that authorized contract initialization
-    pub admin: Address,
+    /// Initialization path (`init_admin`, `init`, `init_with_network`, `init_governance`)
+    pub init_path: Symbol,
+    /// The admin address when initialization is admin-based; `None` for multisig init path
+    pub admin: Option<Address>,
+    /// Number of multisig signers used during initialization (0 for admin-based paths)
+    pub signer_count: u32,
+    /// Multisig threshold used during initialization (0 for admin-based paths)
+    pub threshold: u32,
     /// Initial contract version set during initialization
     pub version: u32,
     /// Ledger timestamp when the contract was initialized
@@ -786,6 +792,8 @@ mod test_strict_mode;
 mod test_contract_registry;
 #[cfg(test)]
 mod test_config_change_timelock;
+#[cfg(test)]
+mod test_build_info_init_event;
 // ==================== END MONITORING MODULE ====================
 
 #[cfg_attr(feature = "contract", contract)]
@@ -793,6 +801,26 @@ pub struct GrainlifyContract;
 #[cfg(feature = "contract")]
 #[contractimpl]
 impl GrainlifyContract {
+    fn emit_build_info_event(
+        env: &Env,
+        init_path: Symbol,
+        admin: Option<Address>,
+        signer_count: u32,
+        threshold: u32,
+    ) {
+        env.events().publish(
+            (symbol_short!("init"), symbol_short!("build")),
+            BuildInfoEvent {
+                init_path,
+                admin,
+                signer_count,
+                threshold,
+                version: VERSION,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+    }
+
     /// One-time initialization: set the admin and initial version. Requires `admin` auth.
     pub fn init_admin(env: Env, admin: Address) {
         if env.storage().instance().has(&DataKey::Version) {
@@ -804,14 +832,12 @@ impl GrainlifyContract {
         env.storage().instance().set(&DataKey::ReadOnlyMode, &false);
         env.storage().instance().set(&DataKey::LivenessSchemaVersion, &LIVENESS_SCHEMA_VERSION);
         
-        // Emit BuildInfo event for initialization tracking and auditing
-        env.events().publish(
-            (symbol_short!("init"), symbol_short!("build")),
-            BuildInfoEvent {
-                admin: admin.clone(),
-                version: VERSION,
-                timestamp: env.ledger().timestamp(),
-            },
+        Self::emit_build_info_event(
+            &env,
+            symbol_short!("adm_init"),
+            Some(admin),
+            0,
+            0,
         );
     }
 
@@ -1812,9 +1838,17 @@ impl GrainlifyContract {
         if env.storage().instance().has(&DataKey::Version) {
             panic!("Already initialized");
         }
+        let signer_count = signers.len();
         MultiSig::init(&env, signers, threshold);
         env.storage().instance().set(&DataKey::Version, &VERSION);
         env.storage().instance().set(&DataKey::ReadOnlyMode, &false);
+        Self::emit_build_info_event(
+            &env,
+            symbol_short!("msig_init"),
+            None,
+            signer_count,
+            threshold,
+        );
     }
 
     /// Initialize with admin, chain_id, and network_id (network-aware init).
@@ -1828,6 +1862,13 @@ impl GrainlifyContract {
         env.storage().instance().set(&DataKey::ReadOnlyMode, &false);
         env.storage().instance().set(&DataKey::ChainId, &chain_id);
         env.storage().instance().set(&DataKey::NetworkId, &network_id);
+        Self::emit_build_info_event(
+            &env,
+            symbol_short!("net_init"),
+            Some(admin),
+            0,
+            0,
+        );
     }
 
     /// Initialize with governance configuration.
@@ -1847,6 +1888,13 @@ impl GrainlifyContract {
         env.storage().instance().set(&DataKey::ReadOnlyMode, &false);
         env.storage().instance().set(&governance::GOVERNANCE_CONFIG, &config);
         env.storage().instance().set(&governance::PROPOSAL_COUNT, &0u32);
+        Self::emit_build_info_event(
+            &env,
+            symbol_short!("gov_init"),
+            Some(admin),
+            0,
+            0,
+        );
     }
 
     // ========================================================================

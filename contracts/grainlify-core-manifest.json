@@ -849,12 +849,27 @@
     "events": [
       {
         "name": "ContractInitialized",
-        "description": "Contract initialization completed with BuildInfo metadata",
+        "description": "Contract initialization completed with BuildInfo metadata across all init entrypoints",
         "data": [
           {
+            "name": "init_path",
+            "type": "Symbol",
+            "description": "Initialization path marker (adm_init, msig_init, net_init, gov_init)"
+          },
+          {
             "name": "admin",
-            "type": "Address",
-            "description": "Administrator address that authorized initialization"
+            "type": "Option<Address>",
+            "description": "Administrator address for admin-based init paths; None for multisig init"
+          },
+          {
+            "name": "signer_count",
+            "type": "u32",
+            "description": "Multisig signer count used during init (0 for admin-based paths)"
+          },
+          {
+            "name": "threshold",
+            "type": "u32",
+            "description": "Multisig threshold used during init (0 for admin-based paths)"
           },
           {
             "name": "version",
@@ -867,8 +882,10 @@
             "description": "Initialization timestamp (ledger time)"
           }
         ],
-        "trigger": "Contract initialization via init_admin()",
-        "security_notes": "Only emitted during first-time initialization; requires admin authorization"
+        "topic": ["init", "build"],
+        "trigger": "Contract initialization via init_admin(), init(), init_with_network(), or init_governance()",
+        "auth_context": "Requires valid initialization authorization for selected init path",
+        "security_notes": "Only emitted during successful first-time initialization; failed or duplicate init attempts do not emit this event"
       },
       {
         "name": "ContractUpgraded",
