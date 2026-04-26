@@ -367,11 +367,16 @@
         "authorization": {
           "type": "string",
           "description": "Authorization requirements",
-          "enum": ["admin", "signer", "any", "capability", "multisig"]
+          "enum": ["admin", "signer", "any", "none", "capability", "multisig", "admin-or-governor"]
         },
         "pausable": {
           "type": "boolean",
           "description": "Whether this function can be paused"
+        },
+        "timelocked": {
+          "type": "boolean",
+          "description": "Whether this function requires a timelock delay before execution",
+          "default": false
         },
         "gas_estimate": {
           "type": "string",
@@ -425,6 +430,16 @@
         },
         "admin_only": {
           "type": "boolean",
+          "default": false
+        },
+        "timelock_seconds": {
+          "type": "integer",
+          "description": "Required timelock delay in seconds for applying this configuration parameter",
+          "minimum": 0
+        },
+        "requires_proposal": {
+          "type": "boolean",
+          "description": "Whether this parameter must be changed via propose/execute governance flow",
           "default": false
         }
       }
