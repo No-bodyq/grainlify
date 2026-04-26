@@ -1,13 +1,18 @@
 #![no_std]
-use soroban_sdk::{contract, contractimpl, contracttype, Address, Env, Symbol};
+use soroban_sdk::{
+    contract, contracterror, contractimpl, contracttype, symbol_short, Address, BytesN, Env,
+    String, Symbol, Vec,
+};
 pub mod asset;
 pub mod commit_reveal;
 pub mod error_registry;
 pub mod errors;
 mod governance;
+mod multisig;
 pub mod nonce;
 pub mod pseudo_randomness;
 pub mod strict_mode;
+use multisig::MultiSig;
 
 #[cfg(test)]
 mod test_error_registry;
@@ -54,6 +59,12 @@ const MAX_TIMELOCK_DELAY: u64 = 2_592_000;
 
 /// [FIX-H02] Minimum allowed timelock delay (1 hour)
 const MIN_TIMELOCK_DELAY: u64 = 3_600;
+
+/// Default delay for config-change execution (6 hours in seconds).
+const DEFAULT_CONFIG_CHANGE_DELAY: u64 = 21_600;
+
+/// Current contract version used during initialization.
+const VERSION: u32 = 2;
 
 // ============================================================================
 // Data Structures
@@ -227,6 +238,22 @@ pub struct PendingAdminRestore {
     pub expires_at: u64,
 }
 
+/// Timelocked config change proposal for snapshot restores.
+///
+/// The proposal is created by admin and can be executed only after `execute_after`.
+/// This adds a review window for high-impact configuration restores.
+#[contracttype]
+#[derive(Clone, Debug, Eq, PartialEq)]
+pub struct ConfigChangeProposal {
+    pub proposal_id: u64,
+    pub snapshot_id: u64,
+    pub proposer: Address,
+    pub created_at: u64,
+    pub execute_after: u64,
+    pub cancelled: bool,
+    pub executed: bool,
+}
+
 /// Kind of contract deployed in the Grainlify ecosystem.
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
@@ -280,6 +307,10 @@ pub struct WatchdogStatus {
 #[contracttype]
 #[derive(Clone, Debug, Eq, PartialEq)]
 pub struct LivenessStatus {
+    pub paused: bool,
+    pub read_only: bool,
+    pub healthy: bool,
+    pub last_ping_ts: u64,
     pub is_paused: bool,
     pub is_read_only: bool,
     pub is_operational: bool,
@@ -400,6 +431,24 @@ pub enum DataKey {
     /// - Used to enforce delay before execution
     /// - proposal_id -> timestamp mapping
     UpgradeTimelock(u64),
+
+    /// Timelock delay period for configuration changes (in seconds)
+    /// - Default: 6 hours (21600 seconds) if not set
+    /// - Admin configurable (bounded by MIN/MAX timelock constants)
+    ConfigChangeDelay,
+
+    /// Monotonic counter for config-change proposal IDs.
+    ConfigChangeCounter,
+
+    /// Timelocked config-change proposal keyed by proposal_id.
+    ConfigChangeProposal(u64),
+
+    /// Deployed contract entry keyed by contract address.
+    DeployedContractEntry(Address),
+
+    /// Ordered index of registered deployed contract addresses.
+    DeployedContractIndex,
+
     /// [FIX-C02] Pending admin restore awaiting new-admin confirmation
     PendingAdminRestore,
     /// Upgrade-safe schema version marker for liveness watchdog storage.
@@ -735,11 +784,13 @@ mod test_version_helpers;
 mod test_strict_mode;
 #[cfg(test)]
 mod test_contract_registry;
+#[cfg(test)]
+mod test_config_change_timelock;
 // ==================== END MONITORING MODULE ====================
 
+#[cfg_attr(feature = "contract", contract)]
+pub struct GrainlifyContract;
 #[cfg(feature = "contract")]
-#[contract]
-pub struct GrainlifyRegistry;
 #[contractimpl]
 impl GrainlifyContract {
     /// One-time initialization: set the admin and initial version. Requires `admin` auth.
@@ -771,6 +822,12 @@ impl GrainlifyContract {
     /// Execute a multisig-approved upgrade after the timelock delay has elapsed.
     pub fn execute_upgrade(env: Env, proposal_id: u64) {
         let start = env.ledger().timestamp();
+        Self::require_not_paused(&env);
+        Self::require_not_read_only(&env);
+
+        if MultiSig::is_state_inconsistent(&env) {
+            panic!("Contract state inconsistent - upgrade blocked");
+        }
 
         let timelock_start: u64 = env
             .storage()
@@ -786,12 +843,36 @@ impl GrainlifyContract {
             let remaining = timelock_delay.saturating_sub(elapsed);
             panic!("Timelock delay not met: {} seconds remaining", remaining);
         }
-        e.storage().instance().set(&DataKey::Admin, &admin);
-    }
-    pub fn set_addr(e: Env, n: Symbol, a: Address) {
-        let adm: Address = e.storage().instance().get(&DataKey::Admin).unwrap();
-        adm.require_auth();
-        e.storage().persistent().set(&DataKey::RegEntry(n), &a);
+
+        if !MultiSig::can_execute(&env, proposal_id) {
+            panic!("Threshold not met or proposal not executable");
+        }
+
+        let wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposal(proposal_id))
+            .unwrap_or_else(|| panic!("Upgrade proposal not found"));
+
+        let current_version: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(1);
+        env.storage().instance().set(&DataKey::PreviousVersion, &current_version);
+
+        MultiSig::mark_executed(&env, proposal_id);
+        env.storage().instance().remove(&DataKey::UpgradeTimelock(proposal_id));
+
+        env.deployer().update_current_contract_wasm(wasm_hash.clone());
+
+        env.events().publish(
+            (symbol_short!("upgrade"), symbol_short!("wasm")),
+            UpgradeEvent {
+                new_wasm_hash: wasm_hash,
+                previous_version: current_version,
+                timestamp: env.ledger().timestamp(),
+            },
+        );
+
+        let duration = env.ledger().timestamp().saturating_sub(start);
+        monitoring::emit_performance(&env, symbol_short!("exec_upg"), duration);
     }
 
     /// Single-admin upgrade path
@@ -880,6 +961,160 @@ impl GrainlifyContract {
         } else {
             None
         }
+    }
+
+    /// Returns the config-change timelock delay in seconds.
+    pub fn get_config_change_delay(env: Env) -> u64 {
+        env.storage()
+            .instance()
+            .get(&DataKey::ConfigChangeDelay)
+            .unwrap_or(DEFAULT_CONFIG_CHANGE_DELAY)
+    }
+
+    /// Sets the config-change timelock delay.
+    ///
+    /// Delay must remain within the same guardrails as the upgrade timelock.
+    pub fn set_config_change_delay(env: Env, delay_seconds: u64) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).unwrap();
+        admin.require_auth();
+        Self::require_not_read_only(&env);
+
+        if delay_seconds < MIN_TIMELOCK_DELAY {
+            panic!("Config change delay must be at least 1 hour (3600 seconds)");
+        }
+        if delay_seconds > MAX_TIMELOCK_DELAY {
+            panic!("Config change delay cannot exceed 30 days (2592000 seconds)");
+        }
+
+        let old_delay = Self::get_config_change_delay(env.clone());
+        env.storage().instance().set(&DataKey::ConfigChangeDelay, &delay_seconds);
+        env.events().publish(
+            (symbol_short!("cfg_tmlk"), symbol_short!("dly_chg")),
+            (old_delay, delay_seconds),
+        );
+    }
+
+    /// Creates a timelocked proposal to restore a configuration snapshot.
+    pub fn propose_config_snapshot_restore(env: Env, snapshot_id: u64) -> u64 {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        admin.require_auth();
+        Self::require_not_read_only(&env);
+
+        if !env.storage().instance().has(&DataKey::ConfigSnapshot(snapshot_id)) {
+            panic!("Snapshot not found or has been pruned");
+        }
+
+        let proposal_id: u64 = env
+            .storage()
+            .instance()
+            .get(&DataKey::ConfigChangeCounter)
+            .unwrap_or(0u64)
+            .saturating_add(1);
+        let now = env.ledger().timestamp();
+        let delay = Self::get_config_change_delay(env.clone());
+        let proposal = ConfigChangeProposal {
+            proposal_id,
+            snapshot_id,
+            proposer: admin,
+            created_at: now,
+            execute_after: now.saturating_add(delay),
+            cancelled: false,
+            executed: false,
+        };
+
+        env.storage().instance().set(&DataKey::ConfigChangeProposal(proposal_id), &proposal);
+        env.storage().instance().set(&DataKey::ConfigChangeCounter, &proposal_id);
+        env.events().publish(
+            (symbol_short!("cfg_tmlk"), symbol_short!("propose")),
+            (proposal_id, snapshot_id, proposal.execute_after),
+        );
+        proposal_id
+    }
+
+    /// Returns a config-change proposal by id.
+    pub fn get_config_change_proposal(env: Env, proposal_id: u64) -> Option<ConfigChangeProposal> {
+        env.storage().instance().get(&DataKey::ConfigChangeProposal(proposal_id))
+    }
+
+    /// Returns remaining delay in seconds for a config-change proposal.
+    ///
+    /// `Some(0)` means executable now. `None` means proposal does not exist.
+    pub fn get_config_change_status(env: Env, proposal_id: u64) -> Option<u64> {
+        let proposal: ConfigChangeProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::ConfigChangeProposal(proposal_id))?;
+
+        if proposal.cancelled || proposal.executed {
+            return Some(0);
+        }
+
+        let now = env.ledger().timestamp();
+        if now >= proposal.execute_after {
+            Some(0)
+        } else {
+            Some(proposal.execute_after.saturating_sub(now))
+        }
+    }
+
+    /// Cancels a pending config-change proposal.
+    pub fn cancel_config_change(env: Env, proposal_id: u64) {
+        let admin: Address = env.storage().instance().get(&DataKey::Admin).expect("Admin not set");
+        admin.require_auth();
+        Self::require_not_read_only(&env);
+
+        let mut proposal: ConfigChangeProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::ConfigChangeProposal(proposal_id))
+            .unwrap_or_else(|| panic!("Config change proposal not found"));
+
+        if proposal.executed {
+            panic!("Config change proposal already executed");
+        }
+        if proposal.cancelled {
+            panic!("Config change proposal already cancelled");
+        }
+
+        proposal.cancelled = true;
+        env.storage().instance().set(&DataKey::ConfigChangeProposal(proposal_id), &proposal);
+        env.events().publish(
+            (symbol_short!("cfg_tmlk"), symbol_short!("cancel")),
+            proposal_id,
+        );
+    }
+
+    /// Executes a timelocked config-change proposal after delay expiry.
+    pub fn execute_config_snapshot_restore(env: Env, proposal_id: u64) {
+        Self::require_not_read_only(&env);
+
+        let mut proposal: ConfigChangeProposal = env
+            .storage()
+            .instance()
+            .get(&DataKey::ConfigChangeProposal(proposal_id))
+            .unwrap_or_else(|| panic!("Config change proposal not found"));
+
+        if proposal.cancelled {
+            panic!("Config change proposal has been cancelled");
+        }
+        if proposal.executed {
+            panic!("Config change proposal already executed");
+        }
+        let now = env.ledger().timestamp();
+        if now < proposal.execute_after {
+            panic!(
+                "Config change timelock not met: {} seconds remaining",
+                proposal.execute_after.saturating_sub(now)
+            );
+        }
+
+        Self::restore_snapshot_with_checks(&env, proposal.snapshot_id);
+        proposal.executed = true;
+        env.storage().instance().set(&DataKey::ConfigChangeProposal(proposal_id), &proposal);
+        env.events().publish(
+            (symbol_short!("cfg_tmlk"), symbol_short!("exec")),
+            (proposal_id, proposal.snapshot_id, now),
+        );
     }
 
     // ========================================================================
@@ -1086,6 +1321,16 @@ impl GrainlifyContract {
         // [GUARDRAIL] Restores mutate state — blocked in read-only mode
         Self::require_not_read_only(&env);
 
+        Self::restore_snapshot_with_checks(&env, snapshot_id);
+
+        env.events().publish(
+            (symbol_short!("cfg_snap"), symbol_short!("restore")),
+            (snapshot_id, env.ledger().timestamp()),
+        );
+    }
+
+    fn restore_snapshot_with_checks(env: &Env, snapshot_id: u64) {
+
         // [FIX-M02] Explicit error when snapshot is pruned
         let snapshot: CoreConfigSnapshot = env.storage().instance()
             .get(&DataKey::ConfigSnapshot(snapshot_id))
@@ -1116,11 +1361,6 @@ impl GrainlifyContract {
 
         // Admin unchanged — apply restore immediately
         Self::apply_snapshot_restore(&env, &snapshot);
-
-        env.events().publish(
-            (symbol_short!("cfg_snap"), symbol_short!("restore")),
-            (snapshot_id, env.ledger().timestamp()),
-        );
     }
 
     /// [FIX-C02] The proposed new admin confirms an admin-changing snapshot restore.
@@ -1296,6 +1536,149 @@ impl GrainlifyContract {
     }
 
     // ========================================================================
+    // Deployed Contract Registry
+    // ========================================================================
+
+    pub fn register_deployed_contract(
+        env: Env,
+        address: Address,
+        name: String,
+        kind: ContractKind,
+        version: u32,
+    ) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        admin.require_auth();
+        Self::require_not_read_only(&env);
+
+        let mut index: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DeployedContractIndex)
+            .unwrap_or(Vec::new(&env));
+
+        let existed = env
+            .storage()
+            .instance()
+            .has(&DataKey::DeployedContractEntry(address.clone()));
+
+        if !existed {
+            if index.len() >= MAX_DEPLOYED_CONTRACTS {
+                panic!("Registry full");
+            }
+            index.push_back(address.clone());
+        }
+
+        let entry = DeployedContract {
+            address: address.clone(),
+            name,
+            kind,
+            version,
+            deployed_at: env.ledger().timestamp(),
+        };
+
+        env.storage()
+            .instance()
+            .set(&DataKey::DeployedContractEntry(address), &entry);
+        env.storage()
+            .instance()
+            .set(&DataKey::DeployedContractIndex, &index);
+    }
+
+    pub fn deregister_deployed_contract(env: Env, address: Address) {
+        let admin: Address = env
+            .storage()
+            .instance()
+            .get(&DataKey::Admin)
+            .expect("Admin not set");
+        admin.require_auth();
+        Self::require_not_read_only(&env);
+
+        let had_entry = env
+            .storage()
+            .instance()
+            .has(&DataKey::DeployedContractEntry(address.clone()));
+        if !had_entry {
+            return;
+        }
+
+        env.storage()
+            .instance()
+            .remove(&DataKey::DeployedContractEntry(address.clone()));
+
+        let index: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DeployedContractIndex)
+            .unwrap_or(Vec::new(&env));
+        let mut trimmed = Vec::new(&env);
+        for i in 0..index.len() {
+            let addr = index.get(i).unwrap();
+            if addr != address {
+                trimmed.push_back(addr);
+            }
+        }
+        env.storage()
+            .instance()
+            .set(&DataKey::DeployedContractIndex, &trimmed);
+    }
+
+    pub fn get_deployed_contract(env: Env, address: Address) -> Option<DeployedContract> {
+        env.storage()
+            .instance()
+            .get(&DataKey::DeployedContractEntry(address))
+    }
+
+    pub fn deployed_contract_count(env: Env) -> u32 {
+        let index: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DeployedContractIndex)
+            .unwrap_or(Vec::new(&env));
+        index.len()
+    }
+
+    pub fn list_deployed_contracts(
+        env: Env,
+        offset: Option<u32>,
+        limit: Option<u32>,
+    ) -> Vec<DeployedContract> {
+        let index: Vec<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::DeployedContractIndex)
+            .unwrap_or(Vec::new(&env));
+        let total = index.len();
+        let off = offset.unwrap_or(0);
+        if off > total {
+            panic!("Offset exceeds registry size");
+        }
+
+        let lim = limit.unwrap_or(total.saturating_sub(off));
+        let end = if off.saturating_add(lim) > total {
+            total
+        } else {
+            off + lim
+        };
+
+        let mut out: Vec<DeployedContract> = Vec::new(&env);
+        for i in off..end {
+            let addr = index.get(i).unwrap();
+            if let Some(entry) = env
+                .storage()
+                .instance()
+                .get::<_, DeployedContract>(&DataKey::DeployedContractEntry(addr))
+            {
+                out.push_back(entry);
+            }
+        }
+        out
+    }
+
+    // ========================================================================
     // Emergency Controls
     // ========================================================================
 
@@ -1340,9 +1723,14 @@ impl GrainlifyContract {
             .get(&DataKey::WatchdogLastPing)
             .unwrap_or(0);
         LivenessStatus {
+            paused: is_paused,
+            read_only: is_read_only,
+            healthy,
+            last_ping_ts,
             is_paused,
             is_read_only,
             is_operational: !is_paused && !is_read_only,
+            version,
             admin_set: env.storage().instance().has(&DataKey::Admin),
             schema_version: env
                 .storage()
@@ -1350,21 +1738,7 @@ impl GrainlifyContract {
                 .get(&DataKey::LivenessSchemaVersion)
                 .unwrap_or(0),
             timestamp: env.ledger().timestamp(),
-            paused: is_paused,
-            read_only: is_read_only,
-            healthy,
-            last_ping_ts,
-            version,
         }
-    }
-
-    /// Returns the liveness schema version written at init.
-    /// Returns `0` on legacy deployments where the marker was never written.
-    pub fn get_liveness_schema_version(env: Env) -> u32 {
-        env.storage()
-            .instance()
-            .get(&DataKey::LivenessSchemaVersion)
-            .unwrap_or(0)
     }
 
     pub fn can_execute(env: Env, proposal_id: u64) -> bool {
@@ -1525,7 +1899,7 @@ impl GrainlifyContract {
 
     /// Pre-commit a migration hash for replay protection.
     /// Must be called before `migrate()` with the same target_version and hash.
-    pub fn commit_migration(env: Env, target_version: u32, hash: BytesN<32>) {
+    pub fn commit_migration(env: Env, target_version: u32, hash: BytesN<32>, expires_at: u64) {
         let admin: Address = env.storage().instance().get(&DataKey::Admin)
             .unwrap_or_else(|| panic!("{}", ContractError::NotInitialized as u32));
         admin.require_auth();
@@ -1534,7 +1908,7 @@ impl GrainlifyContract {
             target_version,
             hash,
             committed_at: env.ledger().timestamp(),
-            expires_at: 0,
+            expires_at,
         };
         env.storage().instance().set(&DataKey::MigrationCommitment(target_version), &commitment);
         env.events().publish(
@@ -1571,9 +1945,24 @@ impl GrainlifyContract {
 
         let current_version: u32 = env.storage().instance().get(&DataKey::Version).unwrap_or(1);
 
+        if target_version <= current_version {
+            panic!("Target version must be greater than current version");
+        }
+
+        if commitment.expires_at > 0 && env.ledger().timestamp() > commitment.expires_at {
+            panic!("Migration commitment has expired");
+        }
+
         // Run version-specific migration logic
         if current_version == 1 && target_version == 2 {
             migrate_v1_to_v2(&env);
+        } else if current_version == 2 && target_version == 3 {
+            migrate_v2_to_v3(&env);
+        } else if current_version == 1 && target_version == 3 {
+            migrate_v1_to_v2(&env);
+            migrate_v2_to_v3(&env);
+        } else {
+            panic!("No migration path available");
         }
 
         let state = MigrationState {
@@ -1605,7 +1994,31 @@ impl GrainlifyContract {
             panic!("Contract is paused");
         }
     }
+
+    fn load_upgrade_proposal(env: &Env, proposal_id: u64) -> Option<UpgradeProposalRecord> {
+        let wasm_hash: BytesN<32> = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposal(proposal_id))?;
+        let proposer: Option<Address> = env
+            .storage()
+            .instance()
+            .get(&DataKey::UpgradeProposalProposer(proposal_id));
+        let proposal = multisig::MultiSig::get_proposal_opt(env, proposal_id)?;
+
+        Some(UpgradeProposalRecord {
+            proposal_id,
+            proposer,
+            wasm_hash,
+            expiry: proposal.expiry,
+            cancelled: proposal.cancelled,
+        })
+    }
 }
+
+fn migrate_v1_to_v2(_env: &Env) {}
+
+fn migrate_v2_to_v3(_env: &Env) {}
 
 // ============================================================================
 // Trait Conformance
